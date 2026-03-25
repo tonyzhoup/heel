@@ -152,7 +152,7 @@ let config = SandboxConfig::builder().ipc(router).build()?;
 let sandbox = Sandbox::with_config(config).await?;
 ```
 
-Sandboxed processes use the `leash-ipc` binary to call registered commands.
+Sandboxed processes use `leash ipc ...` to call registered commands.
 
 ## Python Support
 

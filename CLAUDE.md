@@ -17,7 +17,7 @@ Platform support:
 .
 ├── Cargo.toml      # Main library (leash)
 ├── cli/            # CLI tool (leash-cli) - `leash run`, `leash shell`, `leash python`
-├── ipc/            # IPC helper binary (leash-ipc) - CLI for sandboxed processes to call IPC commands
+├── cli/            # CLI binaries, including `leash ipc` for sandboxed processes to call IPC commands
 └── nodejs/         # Node.js bindings via NAPI-RS (leash-nodejs)
 ```
 
