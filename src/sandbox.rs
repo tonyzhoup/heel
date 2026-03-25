@@ -241,8 +241,8 @@ fn ensure_bundled_leash_binary() -> Result<PathBuf> {
     let status = ProcessCommand::new(&cargo)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .arg("build")
-        .arg("-p")
-        .arg("leash-cli")
+        .arg("--bin")
+        .arg("leash")
         .status()
         .map_err(|error| {
             Error::InitFailed(format!(
@@ -253,7 +253,7 @@ fn ensure_bundled_leash_binary() -> Result<PathBuf> {
 
     if !status.success() {
         return Err(Error::InitFailed(format!(
-            "cargo build -p leash-cli exited with status {status}"
+            "cargo build --bin leash exited with status {status}"
         )));
     }
 
@@ -317,18 +317,6 @@ fn create_leash_launcher(bin_dir: &Path, binary: &Path) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn remove_stale_ipc_launcher(bin_dir: &Path) -> Result<()> {
-    let stale_path = bin_dir.join("leash-ipc");
-    match std::fs::remove_file(&stale_path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(Error::IoError(format!(
-            "failed to remove stale IPC launcher {}: {error}",
-            stale_path.display()
-        ))),
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -507,7 +495,6 @@ impl<N: NetworkPolicy + 'static> Sandbox<N> {
             unblock(move || -> crate::error::Result<()> {
                 std::fs::create_dir_all(&bin_dir)?;
                 create_leash_launcher(&bin_dir, &leash_binary_for_launcher)?;
-                remove_stale_ipc_launcher(&bin_dir)?;
                 for (method, positional_args, stdin_arg) in method_metadata {
                     create_ipc_wrapper(&bin_dir, &method, &positional_args, stdin_arg.as_deref())?;
                 }

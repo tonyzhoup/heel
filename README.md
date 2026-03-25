@@ -46,6 +46,12 @@ Add to your `Cargo.toml`:
 leash = "0.1"
 ```
 
+Install the CLI from the same crate:
+
+```bash
+cargo install leash
+```
+
 ## Quick Start
 
 ```rust
@@ -152,7 +158,7 @@ let config = SandboxConfig::builder().ipc(router).build()?;
 let sandbox = Sandbox::with_config(config).await?;
 ```
 
-Sandboxed processes use the `leash-ipc` binary to call registered commands.
+Sandboxed processes use the `leash ipc` subcommand to call registered commands.
 
 ## Python Support
 
@@ -184,7 +190,7 @@ let output = sandbox
 
 ## CLI
 
-The `leash` CLI provides quick access to sandbox functionality:
+The `leash` crate also ships the `leash` CLI:
 
 ```bash
 # Run a command in sandbox

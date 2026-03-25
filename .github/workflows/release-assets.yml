@@ -37,7 +37,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build leash
-        run: cargo build --locked -p leash-cli --bin leash --target "${{ matrix.target }}"
+        run: cargo build --locked --bin leash --target "${{ matrix.target }}"
 
       - name: Prepare release asset
         id: asset

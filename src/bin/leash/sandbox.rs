@@ -1,6 +1,3 @@
-use std::path::Path;
-use std::process::Output;
-
 use leash::{
     AllowAll, AllowList, Command, DenyAll, PtyExitStatus, PythonConfig, Sandbox, SandboxConfig,
     SandboxConfigBuilder, VenvConfig,
@@ -30,15 +27,6 @@ impl SandboxHandle {
         }
     }
 
-    /// Get the path to the working directory
-    pub fn working_dir(&self) -> &Path {
-        match self {
-            Self::DenyAll(s) => s.working_dir(),
-            Self::AllowAll(s) => s.working_dir(),
-            Self::AllowList(s) => s.working_dir(),
-        }
-    }
-
     /// Keep the working directory after the sandbox is dropped
     pub fn keep_working_dir(&mut self) {
         match self {
@@ -51,24 +39,6 @@ impl SandboxHandle {
             Self::AllowList(s) => {
                 s.keep_working_dir();
             }
-        }
-    }
-
-    /// Run a Python script in the sandbox
-    pub async fn run_python(&self, script: &str) -> leash::Result<Output> {
-        match self {
-            Self::DenyAll(s) => s.run_python(script).await,
-            Self::AllowAll(s) => s.run_python(script).await,
-            Self::AllowList(s) => s.run_python(script).await,
-        }
-    }
-
-    /// Get the proxy URL
-    pub fn proxy_url(&self) -> String {
-        match self {
-            Self::DenyAll(s) => s.proxy_url(),
-            Self::AllowAll(s) => s.proxy_url(),
-            Self::AllowList(s) => s.proxy_url(),
         }
     }
 

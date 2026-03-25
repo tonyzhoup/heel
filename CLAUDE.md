@@ -15,9 +15,9 @@ Platform support:
 
 ```
 .
-├── Cargo.toml      # Main library (leash)
-├── cli/            # CLI tool (leash-cli) - `leash run`, `leash shell`, `leash python`
-├── ipc/            # IPC helper binary (leash-ipc) - CLI for sandboxed processes to call IPC commands
+├── Cargo.toml      # Main library package and `leash` CLI binary
+├── src/bin/leash/  # CLI sources: `leash run`, `leash shell`, `leash python`, `leash ipc`
+├── ipc/            # IPC support library used by the `leash ipc` subcommand
 └── nodejs/         # Node.js bindings via NAPI-RS (leash-nodejs)
 ```
 
@@ -37,9 +37,9 @@ RUST_LOG=debug cargo run --example basic     # With debug logging
 ### CLI usage
 
 ```bash
-cargo run -p leash-cli -- run echo hello     # Run command in sandbox
-cargo run -p leash-cli -- shell              # Interactive shell in sandbox
-cargo run -p leash-cli -- python script.py   # Run Python in sandbox with venv
+cargo run --bin leash -- run echo hello      # Run command in sandbox
+cargo run --bin leash -- shell               # Interactive shell in sandbox
+cargo run --bin leash -- python script.py    # Run Python in sandbox with venv
 ```
 
 ### Platform-specific testing
