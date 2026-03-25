@@ -71,6 +71,7 @@ pub enum CliError {
     #[error("invalid IPC response length: {length}")]
     InvalidIpcResponseLength { length: usize },
 
+    #[cfg(not(unix))]
     #[error("unsupported IPC endpoint: {endpoint}")]
     UnsupportedIpcEndpoint { endpoint: String },
 
