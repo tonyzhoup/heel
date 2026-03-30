@@ -393,6 +393,7 @@ fn add_hardware_restrictions(rules: &mut BTreeMap<i64, Vec<SeccompRule>>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::SecurityConfig;
 
     #[test]
     fn test_arch_detection() {
@@ -401,5 +402,11 @@ mod tests {
         {
             assert!(detect_arch().is_ok());
         }
+    }
+
+    #[test]
+    fn test_filter_program_is_not_empty() {
+        let filter = build_filter(&SecurityConfig::strict(), false, false).unwrap();
+        assert!(!filter.program.is_empty());
     }
 }
