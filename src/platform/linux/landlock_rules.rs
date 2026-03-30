@@ -170,14 +170,17 @@ pub fn build_ruleset(config: &LandlockConfig, proxy_port: u16) -> Result<Prepare
     }
 
     // System config and pseudo-filesystems (read-only, no execute needed)
-    if !config.filesystem_strict() {
-        let system_read_paths = [
-            "/etc", "/proc", "/sys", "/run", // Needed for various runtime files
-        ];
+    //
+    // These are required even in strict mode:
+    // - dynamic loaders and libc consult files under /etc
+    // - procfs/sysfs expose kernel and process metadata many tools rely on
+    // - /run holds runtime resolver and system state
+    //
+    // They remain read-only, so strict mode still blocks writes and user-owned secrets.
+    let system_read_paths = ["/etc", "/proc", "/sys", "/run"];
 
-        for path in &system_read_paths {
-            add_path_rule(&mut ruleset, path, AccessFs::from_read(abi))?;
-        }
+    for path in &system_read_paths {
+        add_path_rule(&mut ruleset, path, AccessFs::from_read(abi))?;
     }
 
     // --- Temp directories (read + write) ---
