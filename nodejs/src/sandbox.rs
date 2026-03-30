@@ -46,12 +46,10 @@ impl Sandbox {
         };
 
         // Create the sandbox with tokio executor
-        let sandbox = heel::Sandbox::with_config_and_executor(
-            rust_config,
-            executor_core::tokio::TokioGlobal,
-        )
-        .await
-        .into_napi()?;
+        let sandbox =
+            heel::Sandbox::with_config_and_executor(rust_config, executor_core::tokio::TokioGlobal)
+                .await
+                .into_napi()?;
 
         let working_dir = sandbox.working_dir().to_string_lossy().to_string();
         let proxy_url = sandbox.proxy_url();

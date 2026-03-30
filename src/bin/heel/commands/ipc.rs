@@ -80,7 +80,7 @@ fn send_request(endpoint: &str, method: &str, params: &[u8]) -> CliResult<String
                 endpoint: endpoint.to_string(),
                 source,
             })?;
-        return send_request_with_stream(&mut stream, method, params);
+        send_request_with_stream(&mut stream, method, params)
     }
 
     #[cfg(not(unix))]
