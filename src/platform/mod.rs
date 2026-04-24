@@ -1,11 +1,12 @@
 use std::future::Future;
-use std::process::{ExitStatus, Output, Stdio};
+use std::process::{ExitStatus, Output};
 
 use blocking::unblock;
 
 use crate::config::SandboxConfigData;
 use crate::error::Result;
 use crate::sandbox::ProcessTracker;
+use crate::stdio::StdioConfig;
 
 #[cfg(target_os = "macos")]
 pub mod macos;
@@ -146,9 +147,9 @@ pub(crate) trait Backend: Sized + Send + Sync {
         args: &[String],
         envs: &[(String, String)],
         current_dir: Option<&std::path::Path>,
-        stdin: Stdio,
-        stdout: Stdio,
-        stderr: Stdio,
+        stdin: StdioConfig,
+        stdout: StdioConfig,
+        stderr: StdioConfig,
     ) -> impl Future<Output = Result<Output>> + Send;
 
     /// Spawn a command as a child process
@@ -161,9 +162,9 @@ pub(crate) trait Backend: Sized + Send + Sync {
         args: &[String],
         envs: &[(String, String)],
         current_dir: Option<&std::path::Path>,
-        stdin: Stdio,
-        stdout: Stdio,
-        stderr: Stdio,
+        stdin: StdioConfig,
+        stdout: StdioConfig,
+        stderr: StdioConfig,
     ) -> impl Future<Output = Result<Child>> + Send;
 }
 

@@ -69,10 +69,11 @@ pub mod pty;
 mod python;
 mod sandbox;
 mod security;
+mod stdio;
 mod workdir;
 
 // Re-export public types
-pub use command::{Command, StdioConfig};
+pub use command::Command;
 pub use config::{
     PythonConfig, PythonConfigBuilder, ResourceLimits, ResourceLimitsBuilder, SandboxConfig,
     SandboxConfigBuilder, VenvConfig, VenvConfigBuilder, python_data_science_preset,
@@ -89,6 +90,7 @@ pub use python::VenvManager;
 pub use rmp_serde;
 pub use sandbox::Sandbox;
 pub use security::{SecurityConfig, SecurityConfigBuilder};
+pub use stdio::StdioConfig;
 pub use workdir::WorkingDir;
 
 // PTY support (macOS only for now)

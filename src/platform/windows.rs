@@ -1,9 +1,10 @@
 use std::future::Future;
-use std::process::{Output, Stdio};
+use std::process::Output;
 
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
 use crate::platform::{Backend, Child};
+use crate::stdio::StdioConfig;
 
 pub struct WindowsBackend;
 
@@ -22,9 +23,9 @@ impl Backend for WindowsBackend {
         _args: &[String],
         _envs: &[(String, String)],
         _current_dir: Option<&std::path::Path>,
-        _stdin: Stdio,
-        _stdout: Stdio,
-        _stderr: Stdio,
+        _stdin: StdioConfig,
+        _stdout: StdioConfig,
+        _stderr: StdioConfig,
     ) -> impl Future<Output = Result<Output>> + Send {
         async { Err(Error::UnsupportedPlatform) }
     }
@@ -37,9 +38,9 @@ impl Backend for WindowsBackend {
         _args: &[String],
         _envs: &[(String, String)],
         _current_dir: Option<&std::path::Path>,
-        _stdin: Stdio,
-        _stdout: Stdio,
-        _stderr: Stdio,
+        _stdin: StdioConfig,
+        _stdout: StdioConfig,
+        _stderr: StdioConfig,
     ) -> impl Future<Output = Result<Child>> + Send {
         async { Err(Error::UnsupportedPlatform) }
     }
