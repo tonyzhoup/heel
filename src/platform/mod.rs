@@ -10,9 +10,7 @@ use std::thread;
 #[cfg(target_os = "windows")]
 use ::windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 #[cfg(target_os = "windows")]
-use ::windows::Win32::System::Threading::{
-    GetExitCodeProcess, INFINITE, TerminateProcess, WaitForSingleObject,
-};
+use ::windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
 #[cfg(target_os = "windows")]
 use ::windows::core::Error as WindowsError;
 use blocking::unblock;
@@ -22,7 +20,7 @@ use crate::config::SandboxConfigData;
 use crate::error::Error;
 use crate::error::Result;
 #[cfg(target_os = "windows")]
-use crate::platform::windows::AppContainerLaunchState;
+use crate::platform::windows::{AppContainerLaunchState, job::JobGuard};
 use crate::sandbox::ProcessTracker;
 use crate::stdio::{ChildStderr, ChildStdin, ChildStdout, StdioConfig};
 
@@ -57,6 +55,7 @@ struct WindowsChild {
     stdout: Option<ChildStdout>,
     stderr: Option<ChildStderr>,
     exit_status: Option<ExitStatus>,
+    job: Option<JobGuard>,
     _launch_state: AppContainerLaunchState,
 }
 
@@ -104,17 +103,18 @@ impl Drop for WindowsHandle {
 impl WindowsChild {
     async fn wait(&mut self) -> Result<ExitStatus> {
         if let Some(status) = self.exit_status {
+            self.close_job();
             return Ok(status);
         }
 
         let process = self.process.raw_value();
         let status = unblock(move || wait_for_windows_process(process)).await?;
-        self.exit_status = Some(status);
-        Ok(status)
+        Ok(self.record_exit_status(status))
     }
 
     fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
         if let Some(status) = self.exit_status {
+            self.close_job();
             return Ok(Some(status));
         }
 
@@ -123,8 +123,7 @@ impl WindowsChild {
             WAIT_TIMEOUT => Ok(None),
             WAIT_OBJECT_0 => {
                 let status = windows_exit_status(process)?;
-                self.exit_status = Some(status);
-                Ok(Some(status))
+                Ok(Some(self.record_exit_status(status)))
             }
             WAIT_FAILED => Err(Error::FfiError(format!(
                 "WaitForSingleObject failed: {}",
@@ -138,12 +137,27 @@ impl WindowsChild {
     }
 
     fn kill(&mut self) -> Result<()> {
-        unsafe {
-            TerminateProcess(handle_from_raw_value(self.process.raw_value()), 1)
-                .map_err(|error| Error::FfiError(format!("TerminateProcess failed: {error}")))?;
-        }
+        self.terminate_job(1)
+    }
 
-        Ok(())
+    fn terminate_job(&self, exit_code: u32) -> Result<()> {
+        let job = self.job.as_ref().ok_or_else(|| {
+            Error::ProcessError(std::io::Error::other(
+                "Windows job object is already closed",
+            ))
+        })?;
+
+        job.terminate(exit_code)
+    }
+
+    fn close_job(&mut self) {
+        drop(self.job.take());
+    }
+
+    fn record_exit_status(&mut self, status: ExitStatus) -> ExitStatus {
+        self.exit_status = Some(status);
+        self.close_job();
+        status
     }
 
     async fn wait_with_output(mut self) -> Result<Output> {
@@ -152,6 +166,7 @@ impl WindowsChild {
         let stdout = self.stdout.take().map(read_windows_pipe);
         let stderr = self.stderr.take().map(read_windows_pipe);
         let status = self.wait().await?;
+        self.close_job();
 
         Ok(Output {
             status,
@@ -238,6 +253,7 @@ impl Child {
         stdin: Option<ChildStdin>,
         stdout: Option<ChildStdout>,
         stderr: Option<ChildStderr>,
+        job: JobGuard,
         launch_state: AppContainerLaunchState,
     ) -> Result<Self> {
         Ok(Self {
@@ -248,6 +264,7 @@ impl Child {
                 stdout,
                 stderr,
                 exit_status: None,
+                job: Some(job),
                 _launch_state: launch_state,
             })),
             tracker: None,
@@ -596,7 +613,7 @@ fn windows_capabilities() -> PlatformCapabilities {
         network_deny_all: false,
         network_allowlist: false,
         ipc: false,
-        background_process_tree_cleanup: false,
+        background_process_tree_cleanup: true,
     }
 }
 
@@ -723,7 +740,7 @@ mod tests {
             assert!(!capabilities.network_deny_all);
             assert!(!capabilities.network_allowlist);
             assert!(!capabilities.ipc);
-            assert!(!capabilities.background_process_tree_cleanup);
+            assert!(capabilities.background_process_tree_cleanup);
         }
     }
 
@@ -737,7 +754,7 @@ mod tests {
         assert!(!capabilities.network_deny_all);
         assert!(!capabilities.network_allowlist);
         assert!(!capabilities.ipc);
-        assert!(!capabilities.background_process_tree_cleanup);
+        assert!(capabilities.background_process_tree_cleanup);
     }
 
     #[test]
@@ -795,6 +812,20 @@ mod tests {
                 network_allowlist: true,
                 ipc: true,
                 background_process_tree_cleanup: false,
+            }
+        );
+
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            capabilities,
+            super::PlatformCapabilities {
+                backend: "windows_appcontainer",
+                execution_supported: false,
+                filesystem_strict: false,
+                network_deny_all: false,
+                network_allowlist: false,
+                ipc: false,
+                background_process_tree_cleanup: true,
             }
         );
     }

@@ -27,11 +27,12 @@ use windows::Win32::System::Console::{
 use windows::Win32::System::Pipes::CreatePipe;
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Threading::{
-    CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, InitializeProcThreadAttributeList,
     LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, STARTUPINFOW, UpdateProcThreadAttribute,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, ResumeThread,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
+    UpdateProcThreadAttribute,
 };
 #[cfg(target_os = "windows")]
 use windows::core::{PCWSTR, PWSTR};
@@ -287,6 +288,7 @@ pub(crate) fn launch_appcontainer_process(
     let mut command_line = wide_null(&command_line(launch.program, launch.args));
     let current_dir = wide_path(launch.current_dir)?;
     let environment = environment_block(launch.base_envs, launch.envs)?;
+    let job = super::job::JobGuard::new()?;
 
     unsafe {
         CreateProcessW(
@@ -295,7 +297,7 @@ pub(crate) fn launch_appcontainer_process(
             None,
             None,
             BOOL(1),
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
             Some(environment.as_ptr().cast()),
             PCWSTR(current_dir.as_ptr()),
             (&startup as *const STARTUPINFOEXW).cast::<STARTUPINFOW>(),
@@ -309,13 +311,19 @@ pub(crate) fn launch_appcontainer_process(
         })?;
     }
 
+    let mut created_process = CreatedProcess::new(process_information);
+    job.assign_process(created_process.process())?;
+    created_process.resume()?;
+    let (process, thread, pid) = created_process.into_parts();
+
     crate::platform::Child::from_windows(
-        process_information.hProcess,
-        process_information.hThread,
-        process_information.dwProcessId,
+        process,
+        thread,
+        pid,
         stdio.parent_stdin,
         stdio.parent_stdout,
         stdio.parent_stderr,
+        job,
         state,
     )
 }
@@ -383,6 +391,86 @@ impl Drop for ProcThreadAttributeList {
             unsafe {
                 DeleteProcThreadAttributeList(self.list);
             }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct CreatedProcess {
+    process: HANDLE,
+    thread: HANDLE,
+    pid: u32,
+    disarmed: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl CreatedProcess {
+    fn new(process_information: PROCESS_INFORMATION) -> Self {
+        Self {
+            process: process_information.hProcess,
+            thread: process_information.hThread,
+            pid: process_information.dwProcessId,
+            disarmed: false,
+        }
+    }
+
+    fn process(&self) -> HANDLE {
+        self.process
+    }
+
+    fn resume(&mut self) -> crate::error::Result<()> {
+        let previous_suspend_count = unsafe { ResumeThread(self.thread) };
+        if previous_suspend_count == u32::MAX {
+            return Err(crate::error::Error::FfiError(format!(
+                "ResumeThread failed: {}",
+                windows::core::Error::from_win32()
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn into_parts(mut self) -> (HANDLE, HANDLE, u32) {
+        self.disarmed = true;
+        (self.process, self.thread, self.pid)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for CreatedProcess {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+
+        if !self.process.is_invalid()
+            && !self.process.0.is_null()
+            && let Err(error) = unsafe { TerminateProcess(self.process, 1) }
+        {
+            tracing::warn!(
+                pid = self.pid,
+                "failed to terminate Windows process after launch error: {error}"
+            );
+        }
+
+        if !self.thread.is_invalid()
+            && !self.thread.0.is_null()
+            && let Err(error) = unsafe { CloseHandle(self.thread) }
+        {
+            tracing::warn!(
+                pid = self.pid,
+                "failed to close Windows thread handle after launch error: {error}"
+            );
+        }
+
+        if !self.process.is_invalid()
+            && !self.process.0.is_null()
+            && let Err(error) = unsafe { CloseHandle(self.process) }
+        {
+            tracing::warn!(
+                pid = self.pid,
+                "failed to close Windows process handle after launch error: {error}"
+            );
         }
     }
 }

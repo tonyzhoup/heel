@@ -1,4 +1,6 @@
 mod acl;
+#[cfg(target_os = "windows")]
+pub(crate) mod job;
 mod paths;
 mod policy;
 mod process;
@@ -295,6 +297,159 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
+    #[ignore = "requires Windows AppContainer process launch and host process polling"]
+    fn windows_job_kills_process_tree() {
+        smol::block_on(async {
+            let (_, config) = SandboxConfig::builder()
+                .build()
+                .expect("config")
+                .into_parts();
+            let backend = WindowsBackend::new().expect("backend");
+            let marker = unique_marker("heel-job-tree");
+
+            let mut child = backend
+                .spawn(
+                    &config,
+                    0,
+                    "cmd.exe",
+                    &["/C".to_string(), background_sleep_command(&marker, 120)],
+                    &[],
+                    None,
+                    StdioConfig::Null,
+                    StdioConfig::Null,
+                    StdioConfig::Null,
+                )
+                .await
+                .expect("cmd should launch sleep descendant in the process tree");
+
+            let root_pid = child.id();
+            poll_until("sleep descendant starts", || {
+                child_process_exists(root_pid, "powershell.exe", &marker)
+            })
+            .expect("sleep child should appear before killing root");
+
+            child.kill().expect("job kill should succeed");
+            drop(child);
+
+            poll_until("sleep descendant exits after job cleanup", || {
+                !command_line_process_exists(&marker)
+            })
+            .expect("sleep child should exit when the job is terminated");
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Windows AppContainer process launch and host process polling"]
+    fn windows_wait_closes_job_after_root_exits_with_background_descendant() {
+        smol::block_on(async {
+            let (_, config) = SandboxConfig::builder()
+                .build()
+                .expect("config")
+                .into_parts();
+            let backend = WindowsBackend::new().expect("backend");
+            let marker = unique_marker("heel-wait-tree");
+
+            let mut child = backend
+                .spawn(
+                    &config,
+                    0,
+                    "cmd.exe",
+                    &[
+                        "/C".to_string(),
+                        format!(
+                            "{} & powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 2\"",
+                            background_sleep_command(&marker, 120)
+                        ),
+                    ],
+                    &[],
+                    None,
+                    StdioConfig::Null,
+                    StdioConfig::Null,
+                    StdioConfig::Null,
+                )
+                .await
+                .expect("cmd should launch sleep descendant in the process tree");
+
+            let root_pid = child.id();
+            poll_until("sleep descendant starts before root exits", || {
+                child_process_exists(root_pid, "powershell.exe", &marker)
+            })
+            .expect("sleep child should appear before waiting for root");
+
+            let status = child.wait().await.expect("root wait should succeed");
+            assert!(status.success(), "root command should exit successfully");
+
+            poll_until("sleep descendant exits after wait closes the job", || {
+                !command_line_process_exists(&marker)
+            })
+            .expect("sleep child should exit when wait observes root exit");
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Windows AppContainer process launch and host process polling"]
+    fn windows_output_closes_job_before_joining_piped_background_descendant() {
+        smol::block_on(async {
+            let (_, config) = SandboxConfig::builder()
+                .build()
+                .expect("config")
+                .into_parts();
+            let backend = WindowsBackend::new().expect("backend");
+            let marker = unique_marker("heel-output-tree");
+            let background_marker = marker.clone();
+
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let output = smol::block_on(async {
+                    backend
+                        .execute(
+                            &config,
+                            0,
+                            "cmd.exe",
+                            &[
+                                "/C".to_string(),
+                                format!(
+                                    "{} & echo heel-output-root-done",
+                                    background_sleep_command(&background_marker, 120)
+                                ),
+                            ],
+                            &[],
+                            None,
+                            StdioConfig::Null,
+                            StdioConfig::Piped,
+                            StdioConfig::Piped,
+                        )
+                        .await
+                });
+                sender.send(output).expect("send output result");
+            });
+
+            let output = receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("output() should finish after root exits and job closes");
+            let output = output.expect("cmd should launch sleep descendant");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+
+            assert!(
+                stdout.contains("heel-output-root-done"),
+                "stdout should contain root marker, got {stdout:?}"
+            );
+            assert!(
+                output.status.success(),
+                "root command should exit successfully: stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                !command_line_process_exists(&marker),
+                "background sleep descendant should be gone after output() closes the job"
+            );
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
     #[ignore = "requires Windows AppContainer file boundary enforcement"]
     fn windows_appcontainer_file_boundaries() {
         smol::block_on(async {
@@ -417,6 +572,62 @@ mod tests {
     #[cfg(target_os = "windows")]
     fn cmd_quoted_path(path: &std::path::Path) -> String {
         format!("\"{}\"", path.display())
+    }
+
+    #[cfg(target_os = "windows")]
+    fn poll_until(label: &str, mut predicate: impl FnMut() -> bool) -> std::io::Result<()> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+        while std::time::Instant::now() < deadline {
+            if predicate() {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("timed out waiting for {label}"),
+        ))
+    }
+
+    #[cfg(target_os = "windows")]
+    fn child_process_exists(parent_pid: u32, image_name: &str, command_marker: &str) -> bool {
+        powershell_process_query(&format!(
+            "ParentProcessId = {parent_pid} AND Name = '{image_name}' AND CommandLine LIKE '%{command_marker}%'"
+        ))
+    }
+
+    #[cfg(target_os = "windows")]
+    fn command_line_process_exists(command_marker: &str) -> bool {
+        powershell_process_query(&format!("CommandLine LIKE '%{command_marker}%'"))
+    }
+
+    #[cfg(target_os = "windows")]
+    fn powershell_process_query(filter: &str) -> bool {
+        let script = format!(
+            "$p = Get-CimInstance Win32_Process -Filter \"{filter}\"; if ($p) {{ exit 0 }} else {{ exit 1 }}"
+        );
+        let Ok(status) = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .status()
+        else {
+            return false;
+        };
+
+        status.success()
+    }
+
+    #[cfg(target_os = "windows")]
+    fn background_sleep_command(marker: &str, seconds: u32) -> String {
+        format!(
+            "start \"\" /B powershell.exe -NoProfile -NonInteractive -Command \"$m='{marker}'; Start-Sleep -Seconds {seconds}\""
+        )
+    }
+
+    #[cfg(target_os = "windows")]
+    fn unique_marker(prefix: &str) -> String {
+        format!("{prefix}-{}", std::process::id())
     }
 
     #[cfg(target_os = "windows")]
