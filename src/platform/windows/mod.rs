@@ -4,6 +4,9 @@ mod policy;
 mod process;
 mod profile;
 
+#[cfg(target_os = "windows")]
+pub(crate) use process::AppContainerLaunchState;
+
 use std::future::Future;
 use std::path::Path;
 use std::process::Output;
@@ -47,6 +50,8 @@ fn launch_supported_config(
 
     #[cfg(target_os = "windows")]
     {
+        let base_envs =
+            process::allowed_environment_from(std::env::vars(), config.env_passthrough())?;
         let profile = profile::AppContainerProfile::create_or_open(profile_name)?;
         let grant_guard = acl::apply_grants_for_appcontainer_sid(&grants, profile.sid())?;
         let launch_state = process::AppContainerLaunchState::new(profile, grant_guard);
@@ -54,9 +59,13 @@ fn launch_supported_config(
             program,
             args,
             current_dir,
+            base_envs: &base_envs,
             envs,
+            stdin,
+            stdout,
+            stderr,
         };
-        let _ = (proxy_port, stdin, stdout, stderr);
+        let _ = proxy_port;
 
         process::launch_appcontainer_process(launch, launch_state)
     }
@@ -211,6 +220,7 @@ mod tests {
         });
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn windows_backend_still_fails_closed_until_process_launch_lands() {
         smol::block_on(async {
@@ -246,6 +256,40 @@ mod tests {
                 Ok(_) => panic!("process launch is intentionally fail-closed until Task 10"),
                 Err(err) => assert!(matches!(err, crate::error::Error::UnsupportedPlatform)),
             }
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Windows AppContainer process launch"]
+    fn windows_backend_executes_cmd_echo_in_appcontainer() {
+        smol::block_on(async {
+            let (_, config) = SandboxConfig::builder()
+                .build()
+                .expect("config")
+                .into_parts();
+            let backend = WindowsBackend::new().expect("backend");
+
+            let output = backend
+                .execute(
+                    &config,
+                    0,
+                    "cmd.exe",
+                    &["/C".to_string(), "echo heel-windows-ok".to_string()],
+                    &[],
+                    None,
+                    StdioConfig::Null,
+                    StdioConfig::Piped,
+                    StdioConfig::Piped,
+                )
+                .await
+                .expect("cmd echo should launch inside AppContainer");
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("heel-windows-ok"),
+                "stdout should contain marker, got {stdout:?}"
+            );
         });
     }
 }

@@ -21,6 +21,8 @@ use crate::config::SandboxConfigData;
 #[cfg(target_os = "windows")]
 use crate::error::Error;
 use crate::error::Result;
+#[cfg(target_os = "windows")]
+use crate::platform::windows::AppContainerLaunchState;
 use crate::sandbox::ProcessTracker;
 use crate::stdio::{ChildStderr, ChildStdin, ChildStdout, StdioConfig};
 
@@ -55,6 +57,7 @@ struct WindowsChild {
     stdout: Option<ChildStdout>,
     stderr: Option<ChildStderr>,
     exit_status: Option<ExitStatus>,
+    _launch_state: AppContainerLaunchState,
 }
 
 #[cfg(target_os = "windows")]
@@ -235,6 +238,7 @@ impl Child {
         stdin: Option<ChildStdin>,
         stdout: Option<ChildStdout>,
         stderr: Option<ChildStderr>,
+        launch_state: AppContainerLaunchState,
     ) -> Result<Self> {
         Ok(Self {
             inner: ChildInner::Windows(Some(WindowsChild {
@@ -244,6 +248,7 @@ impl Child {
                 stdout,
                 stderr,
                 exit_status: None,
+                _launch_state: launch_state,
             })),
             tracker: None,
             pid,
@@ -520,10 +525,14 @@ pub struct PlatformCapabilities {
     /// This string is intended for logs, telemetry, and user-facing status. Do
     /// not branch on it for capability decisions; use the typed boolean fields.
     pub backend: &'static str,
-    /// Whether sandboxed command execution is implemented for this target.
+    /// Whether sandboxed command execution is ready for applications to rely on
+    /// for this target.
     ///
-    /// If this is false, `Sandbox::command(...).output()`, `status()`, and
-    /// `spawn()` are expected to fail closed rather than run natively.
+    /// If this is false, application layers must treat the backend as
+    /// unavailable for sandbox-guaranteed flows. A backend may still contain
+    /// staged implementation code behind this capability while adjacent safety
+    /// work, such as ACL restoration or process-tree cleanup, is still in
+    /// progress.
     pub execution_supported: bool,
     /// Whether the backend supports strict filesystem root enforcement.
     pub filesystem_strict: bool,
@@ -679,11 +688,10 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_child_rejects_invalid_process_handle() {
+    fn windows_handle_rejects_invalid_process_handle() {
         use windows::Win32::Foundation::HANDLE;
 
-        let result =
-            super::Child::from_windows(HANDLE::default(), HANDLE::default(), 123, None, None, None);
+        let result = super::WindowsHandle::new(HANDLE::default(), "process");
 
         match result {
             Ok(_) => panic!("invalid process handle should be rejected"),
