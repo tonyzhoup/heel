@@ -1,7 +1,9 @@
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
 
-pub(crate) fn validate_config_supported(config: &SandboxConfigData) -> Result<()> {
+use super::paths::{RootGrant, grants_from_config};
+
+pub(crate) fn validate_config_supported(config: &SandboxConfigData) -> Result<Vec<RootGrant>> {
     if !config.filesystem_strict() {
         return Err(Error::UnsupportedPlatformVersion {
             platform: "windows-appcontainer-filesystem",
@@ -34,7 +36,7 @@ pub(crate) fn validate_config_supported(config: &SandboxConfigData) -> Result<()
         });
     }
 
-    Ok(())
+    Ok(grants_from_config(config))
 }
 
 #[cfg(test)]
@@ -51,7 +53,9 @@ mod tests {
             .expect("config")
             .into_parts();
 
-        validate_config_supported(&config).expect("default deny-all should be supported");
+        let grants =
+            validate_config_supported(&config).expect("default deny-all should be supported");
+        assert_eq!(grants.len(), 1);
     }
 
     #[test]

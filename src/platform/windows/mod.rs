@@ -1,3 +1,4 @@
+mod paths;
 mod policy;
 mod profile;
 
