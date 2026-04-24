@@ -156,6 +156,8 @@ mod tests {
     use crate::network::AllowAll;
     use crate::platform::Backend;
     use crate::stdio::StdioConfig;
+    #[cfg(target_os = "windows")]
+    use std::process::Output;
 
     #[test]
     fn windows_backend_constructs() {
@@ -163,7 +165,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_runs_policy_validation_before_unsupported_platform() {
+    fn windows_appcontainer_network_deny_all_rejects_allow_all_before_execute_launch() {
         smol::block_on(async {
             let (_, config) = SandboxConfig::builder()
                 .network(AllowAll)
@@ -176,7 +178,7 @@ mod tests {
                 .execute(
                     &config,
                     0,
-                    "cmd.exe",
+                    "heel-should-not-launch.exe",
                     &[],
                     &[],
                     None,
@@ -192,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_runs_policy_validation_before_unsupported_platform() {
+    fn windows_appcontainer_network_deny_all_rejects_allow_all_before_spawn_launch() {
         smol::block_on(async {
             let (_, config) = SandboxConfig::builder()
                 .network(AllowAll)
@@ -205,7 +207,7 @@ mod tests {
                 .spawn(
                     &config,
                     0,
-                    "cmd.exe",
+                    "heel-should-not-launch.exe",
                     &[],
                     &[],
                     None,
@@ -567,6 +569,266 @@ mod tests {
 
             drop(temp_root_guard);
         });
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Windows AppContainer network boundary enforcement"]
+    fn windows_appcontainer_network_deny_all_blocks_outbound_http() {
+        smol::block_on(async {
+            let script = format!(
+                "{}\n{}",
+                powershell_network_probe_prelude(),
+                r#"
+$ProgressPreference = 'SilentlyContinue'
+$ErrorActionPreference = 'Stop'
+try {
+    Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 -Uri 'http://example.com/' -ErrorAction Stop | Out-Null
+    Write-Output 'HEEL_PROBE_ALLOWED:http'
+    exit 0
+} catch {
+    $exception = $_.Exception
+    if ((Test-ExceptionChain $exception 'System.Net.WebException') -or (Test-ExceptionChain $exception 'System.Net.Sockets.SocketException')) {
+        Exit-ProbeDenied 'http' $exception
+    }
+    Exit-ProbeError 'http' $exception
+}
+"#
+            );
+            let host_output = run_host_powershell(&script);
+            assert_probe_allowed("host HTTP positive control", &host_output);
+
+            let output = run_default_deny_all_powershell(&script)
+                .await
+                .expect("HTTP probe should launch inside AppContainer");
+
+            assert_probe_denied("DenyAll AppContainer outbound HTTP", &output);
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Windows AppContainer network boundary enforcement"]
+    fn windows_appcontainer_network_deny_all_blocks_dns_lookup() {
+        smol::block_on(async {
+            let script = format!(
+                "{}\n{}",
+                powershell_network_probe_prelude(),
+                r#"
+$ErrorActionPreference = 'Stop'
+try {
+    [System.Net.Dns]::GetHostAddresses('example.com') | Out-Null
+    Write-Output 'HEEL_PROBE_ALLOWED:dns'
+    exit 0
+} catch {
+    $exception = $_.Exception
+    if (Test-ExceptionChain $exception 'System.Net.Sockets.SocketException') {
+        Exit-ProbeDenied 'dns' $exception
+    }
+    Exit-ProbeError 'dns' $exception
+}
+"#
+            );
+            let host_output = run_host_powershell(&script);
+            assert_probe_allowed("host DNS positive control", &host_output);
+
+            let output = run_default_deny_all_powershell(&script)
+                .await
+                .expect("DNS probe should launch inside AppContainer");
+
+            assert_probe_denied("DenyAll AppContainer DNS lookup", &output);
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Windows AppContainer network boundary enforcement"]
+    fn windows_appcontainer_network_deny_all_blocks_loopback_connection() {
+        smol::block_on(async {
+            let listener =
+                std::net::TcpListener::bind(("127.0.0.1", 0)).expect("host loopback listener");
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking loopback listener");
+            let port = listener.local_addr().expect("listener address").port();
+            let script = format!(
+                "{}\n{}",
+                powershell_network_probe_prelude(),
+                format!(
+                    r#"
+$ErrorActionPreference = 'Stop'
+try {{
+    $client = [System.Net.Sockets.TcpClient]::new()
+    $pending = $client.BeginConnect('127.0.0.1', {port}, $null, $null)
+    if (-not $pending.AsyncWaitHandle.WaitOne(5000)) {{
+        $client.Close()
+        Write-Output 'HEEL_PROBE_DENIED:loopback:connect-timeout'
+        exit 86
+    }}
+    $client.EndConnect($pending)
+    $client.Close()
+    Write-Output 'HEEL_PROBE_ALLOWED:loopback'
+    exit 0
+}} catch {{
+    $exception = $_.Exception
+    if (Test-ExceptionChain $exception 'System.Net.Sockets.SocketException') {{
+        Exit-ProbeDenied 'loopback' $exception
+    }}
+    Exit-ProbeError 'loopback' $exception
+}}
+"#
+                )
+            );
+            let host_output = run_host_powershell(&script);
+            assert_probe_allowed("host loopback positive control", &host_output);
+            accept_loopback_connection(&listener, "host loopback positive control");
+
+            let output = run_default_deny_all_powershell(&script)
+                .await
+                .expect("loopback probe should launch inside AppContainer");
+
+            assert_probe_denied("DenyAll AppContainer loopback connection", &output);
+            match listener.accept() {
+                Ok((_, addr)) => {
+                    panic!("DenyAll AppContainer unexpectedly reached host listener from {addr}")
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("failed to inspect host listener queue: {error}"),
+            }
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    const POWERSHELL_PROBE_DENIED_EXIT: i32 = 86;
+
+    #[cfg(target_os = "windows")]
+    const POWERSHELL_PROBE_ERROR_EXIT: i32 = 87;
+
+    #[cfg(target_os = "windows")]
+    fn powershell_network_probe_prelude() -> &'static str {
+        r#"
+function Test-ExceptionChain {
+    param(
+        [System.Exception] $Exception,
+        [string] $TypeName
+    )
+    while ($null -ne $Exception) {
+        if ($Exception.GetType().FullName -eq $TypeName) {
+            return $true
+        }
+        $Exception = $Exception.InnerException
+    }
+    return $false
+}
+
+function Exit-ProbeDenied {
+    param(
+        [string] $Name,
+        [System.Exception] $Exception
+    )
+    Write-Output "HEEL_PROBE_DENIED:$($Name):$($Exception.GetType().FullName):$($Exception.Message)"
+    exit 86
+}
+
+function Exit-ProbeError {
+    param(
+        [string] $Name,
+        [System.Exception] $Exception
+    )
+    Write-Error "HEEL_PROBE_ERROR:$($Name):$($Exception.GetType().FullName):$($Exception.Message)"
+    exit 87
+}
+"#
+    }
+
+    #[cfg(target_os = "windows")]
+    fn run_host_powershell(script: &str) -> Output {
+        std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .output()
+            .expect("host PowerShell probe should launch")
+    }
+
+    #[cfg(target_os = "windows")]
+    async fn run_default_deny_all_powershell(script: &str) -> crate::error::Result<Output> {
+        let (_, config) = SandboxConfig::builder()
+            .build()
+            .expect("config")
+            .into_parts();
+        let backend = WindowsBackend::new().expect("backend");
+
+        backend
+            .execute(
+                &config,
+                0,
+                "powershell.exe",
+                &[
+                    "-NoProfile".to_string(),
+                    "-NonInteractive".to_string(),
+                    "-Command".to_string(),
+                    script.to_string(),
+                ],
+                &[],
+                None,
+                StdioConfig::Null,
+                StdioConfig::Piped,
+                StdioConfig::Piped,
+            )
+            .await
+    }
+
+    #[cfg(target_os = "windows")]
+    fn assert_probe_allowed(context: &str, output: &Output) {
+        assert!(
+            output.status.success(),
+            "{context} failed; host network prerequisite or probe is unavailable: status={:?}, stdout={}, stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("HEEL_PROBE_ALLOWED"),
+            "{context} exited successfully without the allowed token: stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    fn assert_probe_denied(context: &str, output: &Output) {
+        match output.status.code() {
+            Some(POWERSHELL_PROBE_DENIED_EXIT) => assert!(
+                String::from_utf8_lossy(&output.stdout).contains("HEEL_PROBE_DENIED"),
+                "{context} used the denial exit code without the denial token: stdout={}, stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Some(0) => panic!(
+                "{context} unexpectedly allowed network access: stdout={}, stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Some(POWERSHELL_PROBE_ERROR_EXIT) => panic!(
+                "{context} failed because the PowerShell probe errored: stdout={}, stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            other => panic!(
+                "{context} failed with an unexpected PowerShell status {other:?}: stdout={}, stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn accept_loopback_connection(listener: &std::net::TcpListener, context: &str) {
+        poll_until(context, || match listener.accept() {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(error) => panic!("{context} failed to inspect host listener queue: {error}"),
+        })
+        .expect("host loopback listener should receive the positive-control connection");
     }
 
     #[cfg(target_os = "windows")]

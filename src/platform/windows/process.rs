@@ -237,12 +237,7 @@ pub(crate) fn launch_appcontainer_process(
     let stdio = StdioHandles::new(launch.stdin, launch.stdout, launch.stderr)?;
     let child_handles = stdio.child_handles();
     let attribute_list = ProcThreadAttributeList::new(2)?;
-    let mut security_capabilities = SECURITY_CAPABILITIES {
-        AppContainerSid: state.profile().sid(),
-        Capabilities: std::ptr::null_mut::<SID_AND_ATTRIBUTES>(),
-        CapabilityCount: 0,
-        Reserved: 0,
-    };
+    let mut security_capabilities = appcontainer_security_capabilities(state.profile().sid());
 
     unsafe {
         UpdateProcThreadAttribute(
@@ -326,6 +321,18 @@ pub(crate) fn launch_appcontainer_process(
         job,
         state,
     )
+}
+
+#[cfg(target_os = "windows")]
+fn appcontainer_security_capabilities(
+    appcontainer_sid: windows::Win32::Security::PSID,
+) -> SECURITY_CAPABILITIES {
+    SECURITY_CAPABILITIES {
+        AppContainerSid: appcontainer_sid,
+        Capabilities: std::ptr::null_mut::<SID_AND_ATTRIBUTES>(),
+        CapabilityCount: 0,
+        Reserved: 0,
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -848,13 +855,26 @@ mod tests {
 
 #[cfg(all(test, target_os = "windows"))]
 mod windows_tests {
-    use super::{AppContainerLaunchState, WindowsLaunch, launch_appcontainer_process};
+    use super::{
+        AppContainerLaunchState, WindowsLaunch, appcontainer_security_capabilities,
+        launch_appcontainer_process,
+    };
     use crate::error::Result;
     use crate::platform::Child;
+    use windows::Win32::Security::PSID;
 
     #[test]
     fn appcontainer_launch_process_takes_owned_state() {
         let _launch_fn: for<'a> fn(WindowsLaunch<'a>, AppContainerLaunchState) -> Result<Child> =
             launch_appcontainer_process;
+    }
+
+    #[test]
+    fn appcontainer_security_capabilities_grant_no_network_capabilities() {
+        let capabilities = appcontainer_security_capabilities(PSID::default());
+
+        assert!(capabilities.AppContainerSid.is_invalid());
+        assert!(capabilities.Capabilities.is_null());
+        assert_eq!(capabilities.CapabilityCount, 0);
     }
 }
