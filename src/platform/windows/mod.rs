@@ -1,6 +1,7 @@
 mod acl;
 mod paths;
 mod policy;
+mod process;
 mod profile;
 
 use std::future::Future;
