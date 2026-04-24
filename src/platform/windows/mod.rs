@@ -5,10 +5,11 @@ mod process;
 mod profile;
 
 use std::future::Future;
+use std::path::Path;
 use std::process::Output;
 
 use crate::config::SandboxConfigData;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::platform::{Backend, Child};
 use crate::stdio::StdioConfig;
 
@@ -20,40 +21,119 @@ impl WindowsBackend {
     }
 }
 
+const HEEL_APP_ID: &str = "heel";
+
+pub(crate) fn appcontainer_profile_name(
+    config: &SandboxConfigData,
+) -> Result<profile::ProfileName> {
+    profile::profile_name(HEEL_APP_ID, &config.working_dir().to_string_lossy())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_supported_config(
+    config: &SandboxConfigData,
+    proxy_port: u16,
+    program: &str,
+    args: &[String],
+    envs: &[(String, String)],
+    current_dir: Option<&Path>,
+    stdin: StdioConfig,
+    stdout: StdioConfig,
+    stderr: StdioConfig,
+) -> Result<Child> {
+    let grants = policy::validate_config_supported(config)?;
+    let profile_name = appcontainer_profile_name(config)?;
+    let current_dir = current_dir.unwrap_or(config.working_dir());
+
+    #[cfg(target_os = "windows")]
+    {
+        let profile = profile::AppContainerProfile::create_or_open(profile_name)?;
+        let grant_guard = acl::apply_grants_for_appcontainer_sid(&grants, profile.sid())?;
+        let launch_state = process::AppContainerLaunchState::new(profile, grant_guard);
+        let launch = process::WindowsLaunch {
+            program,
+            args,
+            current_dir,
+            envs,
+        };
+        let _ = (proxy_port, stdin, stdout, stderr);
+
+        process::launch_appcontainer_process(launch, launch_state)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (
+            grants,
+            profile_name,
+            proxy_port,
+            program,
+            args,
+            envs,
+            current_dir,
+            stdin,
+            stdout,
+            stderr,
+        );
+
+        Err(crate::error::Error::UnsupportedPlatform)
+    }
+}
+
 impl Backend for WindowsBackend {
     fn execute(
         &self,
         config: &SandboxConfigData,
-        _proxy_port: u16,
-        _program: &str,
-        _args: &[String],
-        _envs: &[(String, String)],
-        _current_dir: Option<&std::path::Path>,
-        _stdin: StdioConfig,
-        _stdout: StdioConfig,
-        _stderr: StdioConfig,
+        proxy_port: u16,
+        program: &str,
+        args: &[String],
+        envs: &[(String, String)],
+        current_dir: Option<&std::path::Path>,
+        stdin: StdioConfig,
+        stdout: StdioConfig,
+        stderr: StdioConfig,
     ) -> impl Future<Output = Result<Output>> + Send {
-        async {
-            policy::validate_config_supported(config)?;
-            Err(Error::UnsupportedPlatform)
+        async move {
+            let child = launch_supported_config(
+                config,
+                proxy_port,
+                program,
+                args,
+                envs,
+                current_dir,
+                stdin,
+                stdout,
+                stderr,
+            )?;
+
+            child.wait_with_output().await
         }
     }
 
     fn spawn(
         &self,
         config: &SandboxConfigData,
-        _proxy_port: u16,
-        _program: &str,
-        _args: &[String],
-        _envs: &[(String, String)],
-        _current_dir: Option<&std::path::Path>,
-        _stdin: StdioConfig,
-        _stdout: StdioConfig,
-        _stderr: StdioConfig,
+        proxy_port: u16,
+        program: &str,
+        args: &[String],
+        envs: &[(String, String)],
+        current_dir: Option<&std::path::Path>,
+        stdin: StdioConfig,
+        stdout: StdioConfig,
+        stderr: StdioConfig,
     ) -> impl Future<Output = Result<Child>> + Send {
-        async {
-            policy::validate_config_supported(config)?;
-            Err(Error::UnsupportedPlatform)
+        async move {
+            launch_supported_config(
+                config,
+                proxy_port,
+                program,
+                args,
+                envs,
+                current_dir,
+                stdin,
+                stdout,
+                stderr,
+            )
         }
     }
 }
@@ -127,6 +207,44 @@ mod tests {
             match result {
                 Ok(_) => panic!("policy validation should reject before process launch"),
                 Err(err) => assert!(err.to_string().contains("windows-appcontainer-network")),
+            }
+        });
+    }
+
+    #[test]
+    fn windows_backend_still_fails_closed_until_process_launch_lands() {
+        smol::block_on(async {
+            let (_, config) = SandboxConfig::builder()
+                .working_dir("C:/Heel/session")
+                .build()
+                .expect("config")
+                .into_parts();
+            let backend = WindowsBackend::new().expect("backend");
+            let profile_name = super::appcontainer_profile_name(&config).expect("profile name");
+
+            assert_eq!(
+                profile_name,
+                super::appcontainer_profile_name(&config).unwrap()
+            );
+            assert!(profile_name.as_str().starts_with("heel.heel."));
+
+            let result = backend
+                .spawn(
+                    &config,
+                    0,
+                    "cmd.exe",
+                    &["/C".to_string(), "echo ok".to_string()],
+                    &[("HEEL_TEST".to_string(), "1".to_string())],
+                    None,
+                    StdioConfig::Null,
+                    StdioConfig::Piped,
+                    StdioConfig::Piped,
+                )
+                .await;
+
+            match result {
+                Ok(_) => panic!("process launch is intentionally fail-closed until Task 10"),
+                Err(err) => assert!(matches!(err, crate::error::Error::UnsupportedPlatform)),
             }
         });
     }

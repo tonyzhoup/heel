@@ -2,6 +2,7 @@ use crate::error::Result;
 
 use super::paths::RootGrant;
 
+#[must_use = "dropping AclGrantGuard may revoke filesystem access for the AppContainer"]
 pub(crate) struct AclGrantGuard {
     count: usize,
 }

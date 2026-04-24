@@ -52,12 +52,36 @@ pub(crate) struct WindowsLaunch<'a> {
 }
 
 #[cfg(target_os = "windows")]
+pub(crate) struct AppContainerLaunchState {
+    profile: super::profile::AppContainerProfile,
+    _grant_guard: super::acl::AclGrantGuard,
+}
+
+#[cfg(target_os = "windows")]
+impl AppContainerLaunchState {
+    pub(crate) fn new(
+        profile: super::profile::AppContainerProfile,
+        grant_guard: super::acl::AclGrantGuard,
+    ) -> Self {
+        Self {
+            profile,
+            _grant_guard: grant_guard,
+        }
+    }
+
+    pub(crate) fn profile(&self) -> &super::profile::AppContainerProfile {
+        &self.profile
+    }
+}
+
+#[cfg(target_os = "windows")]
 pub(crate) fn launch_appcontainer_process(
     launch: WindowsLaunch<'_>,
-    _profile: &super::profile::AppContainerProfile,
+    state: AppContainerLaunchState,
 ) -> crate::error::Result<crate::platform::Child> {
     let _ = command_line(launch.program, launch.args);
     let _ = (launch.current_dir, launch.envs);
+    let _ = state.profile();
     Err(crate::error::Error::UnsupportedPlatform)
 }
 
@@ -86,5 +110,18 @@ mod tests {
             quote_arg(r"C:\Program Files\Python\"),
             r#""C:\Program Files\Python\\""#
         );
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_tests {
+    use super::{AppContainerLaunchState, WindowsLaunch, launch_appcontainer_process};
+    use crate::error::Result;
+    use crate::platform::Child;
+
+    #[test]
+    fn appcontainer_launch_process_takes_owned_state() {
+        let _launch_fn: for<'a> fn(WindowsLaunch<'a>, AppContainerLaunchState) -> Result<Child> =
+            launch_appcontainer_process;
     }
 }
