@@ -135,20 +135,46 @@ impl Child {
     }
 }
 
+/// Static sandbox capability metadata for the current target platform.
+///
+/// This describes which backend features this crate build implements for the
+/// target OS. Runtime initialization can still fail because of OS version,
+/// kernel, entitlement, or host policy requirements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PlatformCapabilities {
+    /// Diagnostic backend identifier.
+    ///
+    /// This string is intended for logs, telemetry, and user-facing status. Do
+    /// not branch on it for capability decisions; use the typed boolean fields.
     pub backend: &'static str,
+    /// Whether sandboxed command execution is implemented for this target.
+    ///
+    /// If this is false, `Sandbox::command(...).output()`, `status()`, and
+    /// `spawn()` are expected to fail closed rather than run natively.
+    pub execution_supported: bool,
+    /// Whether the backend supports strict filesystem root enforcement.
     pub filesystem_strict: bool,
+    /// Whether the backend can enforce a deny-all network policy.
     pub network_deny_all: bool,
+    /// Whether the backend can enforce network allowlists through Heel policy.
     pub network_allowlist: bool,
+    /// Whether Heel IPC is supported from sandboxed children on this platform.
     pub ipc: bool,
+    /// Whether child process tree cleanup is implemented by the platform backend.
     pub background_process_tree_cleanup: bool,
 }
 
 #[cfg(target_os = "macos")]
 pub fn platform_capabilities() -> PlatformCapabilities {
+    macos_capabilities()
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_capabilities() -> PlatformCapabilities {
     PlatformCapabilities {
         backend: "macos_sandbox_exec",
+        execution_supported: true,
         filesystem_strict: false,
         network_deny_all: true,
         network_allowlist: true,
@@ -159,8 +185,14 @@ pub fn platform_capabilities() -> PlatformCapabilities {
 
 #[cfg(target_os = "linux")]
 pub fn platform_capabilities() -> PlatformCapabilities {
+    linux_capabilities()
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn linux_capabilities() -> PlatformCapabilities {
     PlatformCapabilities {
         backend: "linux_landlock_seccomp",
+        execution_supported: true,
         filesystem_strict: true,
         network_deny_all: true,
         network_allowlist: true,
@@ -171,13 +203,19 @@ pub fn platform_capabilities() -> PlatformCapabilities {
 
 #[cfg(target_os = "windows")]
 pub fn platform_capabilities() -> PlatformCapabilities {
+    windows_capabilities()
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_capabilities() -> PlatformCapabilities {
     PlatformCapabilities {
         backend: "windows_appcontainer",
-        filesystem_strict: true,
-        network_deny_all: true,
+        execution_supported: false,
+        filesystem_strict: false,
+        network_deny_all: false,
         network_allowlist: false,
         ipc: false,
-        background_process_tree_cleanup: true,
+        background_process_tree_cleanup: false,
     }
 }
 
@@ -185,6 +223,7 @@ pub fn platform_capabilities() -> PlatformCapabilities {
 pub fn platform_capabilities() -> PlatformCapabilities {
     PlatformCapabilities {
         backend: "unsupported",
+        execution_supported: false,
         filesystem_strict: false,
         network_deny_all: false,
         network_allowlist: false,
@@ -270,11 +309,84 @@ mod tests {
         let capabilities = platform_capabilities();
 
         if cfg!(target_os = "windows") {
-            assert!(capabilities.filesystem_strict);
-            assert!(capabilities.network_deny_all);
+            assert!(!capabilities.execution_supported);
+            assert!(!capabilities.filesystem_strict);
+            assert!(!capabilities.network_deny_all);
             assert!(!capabilities.network_allowlist);
             assert!(!capabilities.ipc);
-            assert!(capabilities.background_process_tree_cleanup);
+            assert!(!capabilities.background_process_tree_cleanup);
         }
+    }
+
+    #[test]
+    fn windows_stub_capability_contract_is_fail_closed() {
+        let capabilities = super::windows_capabilities();
+
+        assert_eq!(capabilities.backend, "windows_appcontainer");
+        assert!(!capabilities.execution_supported);
+        assert!(!capabilities.filesystem_strict);
+        assert!(!capabilities.network_deny_all);
+        assert!(!capabilities.network_allowlist);
+        assert!(!capabilities.ipc);
+        assert!(!capabilities.background_process_tree_cleanup);
+    }
+
+    #[test]
+    fn macos_capability_contract_is_explicit() {
+        let capabilities = super::macos_capabilities();
+
+        assert_eq!(capabilities.backend, "macos_sandbox_exec");
+        assert!(capabilities.execution_supported);
+        assert!(!capabilities.filesystem_strict);
+        assert!(capabilities.network_deny_all);
+        assert!(capabilities.network_allowlist);
+        assert!(capabilities.ipc);
+        assert!(!capabilities.background_process_tree_cleanup);
+    }
+
+    #[test]
+    fn linux_capability_contract_is_explicit() {
+        let capabilities = super::linux_capabilities();
+
+        assert_eq!(capabilities.backend, "linux_landlock_seccomp");
+        assert!(capabilities.execution_supported);
+        assert!(capabilities.filesystem_strict);
+        assert!(capabilities.network_deny_all);
+        assert!(capabilities.network_allowlist);
+        assert!(capabilities.ipc);
+        assert!(!capabilities.background_process_tree_cleanup);
+    }
+
+    #[test]
+    fn active_platform_capability_contract_is_explicit() {
+        let capabilities = platform_capabilities();
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            capabilities,
+            super::PlatformCapabilities {
+                backend: "macos_sandbox_exec",
+                execution_supported: true,
+                filesystem_strict: false,
+                network_deny_all: true,
+                network_allowlist: true,
+                ipc: true,
+                background_process_tree_cleanup: false,
+            }
+        );
+
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            capabilities,
+            super::PlatformCapabilities {
+                backend: "linux_landlock_seccomp",
+                execution_supported: true,
+                filesystem_strict: true,
+                network_deny_all: true,
+                network_allowlist: true,
+                ipc: true,
+                background_process_tree_cleanup: false,
+            }
+        );
     }
 }
