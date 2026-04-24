@@ -16,9 +16,22 @@
   - Add `PlatformCapabilities`.
   - Add `platform_capabilities()`.
   - Keep `Backend` trait stable during the first task.
+  - Later refactor `Child` to wrap platform-native child implementations.
+
+- Create `src/stdio.rs`
+  - Own platform-neutral `StdioConfig`.
+  - Own `ChildStdin`, `ChildStdout`, and `ChildStderr` handle aliases/wrappers.
+  - Let Windows direct Win32 launch see semantic stdio choices before they are
+    converted into opaque OS handles.
 
 - Modify `src/lib.rs`
-  - Re-export `platform_capabilities` and `PlatformCapabilities`.
+  - Re-export `platform_capabilities`, `PlatformCapabilities`, `StdioConfig`,
+    and child stdio handle types.
+
+- Modify `src/command.rs`
+  - Import `StdioConfig` from `src/stdio.rs`.
+  - Pass `StdioConfig` into backend methods instead of converting to
+    `std::process::Stdio` before dispatch.
 
 - Modify `src/platform/windows.rs`
   - Keep `WindowsBackend` as the public Windows backend module entry.
@@ -50,6 +63,195 @@
 
 - Modify `Cargo.toml`
   - Add missing `windows` crate feature flags as each Win32 API is introduced.
+
+- Modify `nodejs/src/child.rs`
+  - Adapt to the cross-platform child stdio handle wrappers after the child
+    refactor lands.
+
+---
+
+### Task 1A: Move StdioConfig to a Platform-Neutral Module
+
+**Files:**
+- Create: `src/stdio.rs`
+- Modify: `src/command.rs`
+- Modify: `src/lib.rs`
+- Modify: `src/platform/mod.rs`
+- Modify: `src/platform/macos/mod.rs`
+- Modify: `src/platform/linux/mod.rs`
+- Modify: `src/platform/windows.rs`
+
+- [ ] **Step 1: Write a failing test against the current StdioConfig**
+
+Add this temporary test module to `src/command.rs` while `StdioConfig` still
+lives there:
+
+```rust
+#[cfg(test)]
+mod stdio_tests {
+    use super::StdioConfig;
+
+    #[test]
+    fn stdio_config_is_copyable_and_comparable() {
+        let config = StdioConfig::Piped;
+        let copied = config;
+
+        assert_eq!(config, copied);
+    }
+}
+```
+
+- [ ] **Step 2: Run the test and verify the missing behavior**
+
+Run:
+
+```bash
+cargo test stdio_config_is_copyable_and_comparable
+```
+
+Expected: FAIL because the current `StdioConfig` is copyable but does not
+implement `PartialEq`.
+
+- [ ] **Step 3: Move StdioConfig into `src/stdio.rs`**
+
+Create `src/stdio.rs`:
+
+```rust
+use std::process::Stdio;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StdioConfig {
+    Inherit,
+    Piped,
+    Null,
+}
+
+impl From<StdioConfig> for Stdio {
+    fn from(config: StdioConfig) -> Self {
+        match config {
+            StdioConfig::Inherit => Stdio::inherit(),
+            StdioConfig::Piped => Stdio::piped(),
+            StdioConfig::Null => Stdio::null(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StdioConfig;
+
+    #[test]
+    fn stdio_config_is_copyable_and_comparable() {
+        let config = StdioConfig::Piped;
+        let copied = config;
+
+        assert_eq!(config, copied);
+    }
+}
+```
+
+Add this to `src/lib.rs` near the other modules:
+
+```rust
+mod stdio;
+```
+
+Change this in `src/lib.rs`:
+
+```rust
+pub use command::{Command, StdioConfig};
+```
+
+to:
+
+```rust
+pub use command::Command;
+pub use stdio::StdioConfig;
+```
+
+Delete the `StdioConfig` enum and `impl From<StdioConfig> for Stdio` from
+`src/command.rs`, then add:
+
+```rust
+use crate::stdio::StdioConfig;
+```
+
+- [ ] **Step 4: Change Backend trait to accept `StdioConfig`**
+
+In `src/platform/mod.rs`, replace:
+
+```rust
+use std::process::{ExitStatus, Output, Stdio};
+```
+
+with:
+
+```rust
+use std::process::{ExitStatus, Output};
+
+use crate::stdio::StdioConfig;
+```
+
+Change the `Backend` trait `execute()` and `spawn()` parameters from
+`stdin: Stdio, stdout: Stdio, stderr: Stdio` to
+`stdin: StdioConfig, stdout: StdioConfig, stderr: StdioConfig`.
+
+- [ ] **Step 5: Update command dispatch to pass semantic stdio**
+
+In `src/command.rs`, change all backend calls from:
+
+```rust
+self.stdin.into()
+```
+
+to:
+
+```rust
+self.stdin
+```
+
+Do the same for `stdout` and `stderr`. For `output()`, pass
+`StdioConfig::Null`, `StdioConfig::Piped`, and `StdioConfig::Piped`.
+
+- [ ] **Step 6: Convert to `std::process::Stdio` inside Unix backends**
+
+In `src/platform/macos/mod.rs` and `src/platform/linux/mod.rs`, import:
+
+```rust
+use crate::stdio::StdioConfig;
+```
+
+Change backend method signatures to accept `StdioConfig`. At the final command
+construction point, call:
+
+```rust
+cmd.stdin(launch.stdin.into());
+cmd.stdout(launch.stdout.into());
+cmd.stderr(launch.stderr.into());
+```
+
+or the equivalent local variable names in the macOS backend.
+
+In `src/platform/windows.rs`, change the stub signatures to accept
+`StdioConfig` and keep returning `UnsupportedPlatform`.
+
+- [ ] **Step 7: Run tests**
+
+Run:
+
+```bash
+cargo test stdio_config_is_copyable_and_comparable
+cargo test
+```
+
+Expected: all tests PASS on the current platform.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src/stdio.rs src/lib.rs src/command.rs src/platform/mod.rs src/platform/macos/mod.rs src/platform/linux/mod.rs src/platform/windows.rs
+git commit -m "refactor: pass semantic stdio to sandbox backends"
+```
 
 ---
 
@@ -643,10 +845,13 @@ git commit -m "feat: create windows appcontainer profiles"
 ### Task 5: Refactor Child for Platform-Native Handles
 
 **Files:**
+- Modify: `src/stdio.rs`
 - Modify: `src/platform/mod.rs`
 - Modify: `src/platform/macos/mod.rs`
 - Modify: `src/platform/linux/mod.rs`
 - Modify: `src/platform/windows.rs`
+- Modify: `src/sandbox.rs`
+- Modify: `nodejs/src/child.rs`
 
 - [ ] **Step 1: Write tests for existing child behavior on Unix**
 
@@ -687,6 +892,30 @@ enum ChildInner {
 }
 ```
 
+Add these public stdio aliases in `src/stdio.rs`:
+
+```rust
+#[cfg(not(target_os = "windows"))]
+pub type ChildStdin = std::process::ChildStdin;
+#[cfg(not(target_os = "windows"))]
+pub type ChildStdout = std::process::ChildStdout;
+#[cfg(not(target_os = "windows"))]
+pub type ChildStderr = std::process::ChildStderr;
+
+#[cfg(target_os = "windows")]
+pub type ChildStdin = std::fs::File;
+#[cfg(target_os = "windows")]
+pub type ChildStdout = std::fs::File;
+#[cfg(target_os = "windows")]
+pub type ChildStderr = std::fs::File;
+```
+
+Add this import to `src/platform/mod.rs`:
+
+```rust
+use crate::stdio::{ChildStderr, ChildStdin, ChildStdout};
+```
+
 Add:
 
 ```rust
@@ -718,7 +947,7 @@ For `stdin`, `stdout`, `stderr`, `take_stdin`, `take_stdout`, `take_stderr`,
 For example:
 
 ```rust
-pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+pub fn take_stdout(&mut self) -> Option<ChildStdout> {
     match &mut self.inner {
         ChildInner::Std(inner) => inner.as_mut().and_then(|child| child.stdout.take()),
     }
@@ -726,6 +955,16 @@ pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
 ```
 
 Use the same existing behavior for the `Std` variant.
+
+Change the signatures for `stdin`, `stdout`, `stderr`, `take_stdin`,
+`take_stdout`, and `take_stderr` to use `ChildStdin`, `ChildStdout`, and
+`ChildStderr`.
+
+Re-export these aliases in `src/lib.rs`:
+
+```rust
+pub use stdio::{ChildStderr, ChildStdin, ChildStdout, StdioConfig};
+```
 
 - [ ] **Step 4: Run existing tests**
 
@@ -742,6 +981,7 @@ Expected: new test passes and existing tests keep passing.
 
 ```bash
 git add src/platform/mod.rs src/platform/macos/mod.rs src/platform/linux/mod.rs src/platform/windows.rs
+git add src/stdio.rs src/lib.rs src/sandbox.rs nodejs/src/child.rs
 git commit -m "refactor: prepare child abstraction for native windows handles"
 ```
 
@@ -766,18 +1006,21 @@ pub(crate) enum RootAccess {
     Write,
     Execute,
     Full,
+    Runtime,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RootGrant {
     pub path: PathBuf,
     pub access: RootAccess,
+    pub is_directory: bool,
 }
 
-pub(crate) fn grant(path: impl AsRef<Path>, access: RootAccess) -> RootGrant {
+pub(crate) fn grant(path: impl AsRef<Path>, access: RootAccess, is_directory: bool) -> RootGrant {
     RootGrant {
         path: path.as_ref().to_path_buf(),
         access,
+        is_directory,
     }
 }
 
@@ -787,10 +1030,11 @@ mod tests {
 
     #[test]
     fn grant_keeps_path_and_access() {
-        let item = grant("C:/Eureka/session", RootAccess::Full);
+        let item = grant("C:/Eureka/session", RootAccess::Full, true);
 
         assert_eq!(item.path.to_string_lossy(), "C:/Eureka/session");
         assert_eq!(item.access, RootAccess::Full);
+        assert!(item.is_directory);
     }
 }
 ```
@@ -820,10 +1064,13 @@ use crate::config::SandboxConfigData;
 
 pub(crate) fn grants_from_config(config: &SandboxConfigData) -> Vec<RootGrant> {
     let mut grants = Vec::new();
-    grants.push(grant(config.working_dir(), RootAccess::Full));
-    grants.extend(config.readable_paths().iter().map(|path| grant(path, RootAccess::Read)));
-    grants.extend(config.writable_paths().iter().map(|path| grant(path, RootAccess::Full)));
-    grants.extend(config.executable_paths().iter().map(|path| grant(path, RootAccess::Execute)));
+    grants.push(grant(config.working_dir(), RootAccess::Full, true));
+    grants.extend(config.readable_paths().iter().map(|path| grant(path, RootAccess::Read, path.is_dir())));
+    grants.extend(config.writable_paths().iter().map(|path| grant(path, RootAccess::Full, path.is_dir())));
+    grants.extend(config.executable_paths().iter().map(|path| grant(path, RootAccess::Execute, path.is_dir())));
+    if let Some(venv_path) = config.python_venv_path() {
+        grants.push(grant(venv_path, RootAccess::Runtime, true));
+    }
     grants
 }
 ```
@@ -848,6 +1095,25 @@ fn grants_from_config_maps_roots_to_access_classes() {
     assert!(grants.iter().any(|item| item.access == RootAccess::Read && item.path.ends_with("read")));
     assert!(grants.iter().any(|item| item.access == RootAccess::Full && item.path.ends_with("write")));
     assert!(grants.iter().any(|item| item.access == RootAccess::Execute && item.path.ends_with("python")));
+}
+```
+
+Add a second test proving permissive security does not add home roots:
+
+```rust
+#[test]
+fn grants_from_config_do_not_expand_permissive_security_to_home() {
+    let (_, config) = crate::config::SandboxConfig::builder()
+        .working_dir("C:/Eureka/work")
+        .security(crate::SecurityConfig::permissive())
+        .build()
+        .expect("config")
+        .into_parts();
+
+    let grants = super::grants_from_config(&config);
+
+    assert_eq!(grants.len(), 1);
+    assert!(grants[0].path.ends_with("work"));
 }
 ```
 
