@@ -50,6 +50,7 @@ smol = "2"
 # Compile-time templates
 askama = "0.12"
 shell-escape = "0.1"
+sha2 = "0.10"
 
 # Terminal raw mode
 crossterm = "0.29"
