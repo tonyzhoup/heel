@@ -90,7 +90,7 @@ pub use python::VenvManager;
 pub use rmp_serde;
 pub use sandbox::Sandbox;
 pub use security::{SecurityConfig, SecurityConfigBuilder};
-pub use stdio::StdioConfig;
+pub use stdio::{ChildStderr, ChildStdin, ChildStdout, StdioConfig};
 pub use workdir::WorkingDir;
 
 // PTY support (macOS only for now)

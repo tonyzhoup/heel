@@ -1,12 +1,28 @@
 use std::future::Future;
+#[cfg(target_os = "windows")]
+use std::io::Read;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::ExitStatusExt;
 use std::process::{ExitStatus, Output};
+#[cfg(target_os = "windows")]
+use std::thread;
 
+#[cfg(target_os = "windows")]
+use ::windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+#[cfg(target_os = "windows")]
+use ::windows::Win32::System::Threading::{
+    GetExitCodeProcess, INFINITE, TerminateProcess, WaitForSingleObject,
+};
+#[cfg(target_os = "windows")]
+use ::windows::core::Error as WindowsError;
 use blocking::unblock;
 
 use crate::config::SandboxConfigData;
+#[cfg(target_os = "windows")]
+use crate::error::Error;
 use crate::error::Result;
 use crate::sandbox::ProcessTracker;
-use crate::stdio::StdioConfig;
+use crate::stdio::{ChildStderr, ChildStdin, ChildStdout, StdioConfig};
 
 #[cfg(target_os = "macos")]
 pub mod macos;
@@ -19,19 +35,219 @@ pub mod windows;
 
 /// A spawned child process in the sandbox
 pub struct Child {
-    inner: Option<std::process::Child>,
+    inner: ChildInner,
     tracker: Option<ProcessTracker>,
     pid: u32,
 }
 
+enum ChildInner {
+    #[cfg(not(target_os = "windows"))]
+    Std(Option<std::process::Child>),
+    #[cfg(target_os = "windows")]
+    Windows(Option<WindowsChild>),
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsChild {
+    process: WindowsHandle,
+    _thread: WindowsHandle,
+    stdin: Option<ChildStdin>,
+    stdout: Option<ChildStdout>,
+    stderr: Option<ChildStderr>,
+    exit_status: Option<ExitStatus>,
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsHandle {
+    handle: HANDLE,
+    label: &'static str,
+}
+
+#[cfg(target_os = "windows")]
+unsafe impl Send for WindowsHandle {}
+
+#[cfg(target_os = "windows")]
+impl WindowsHandle {
+    fn new(handle: HANDLE, label: &'static str) -> Result<Self> {
+        if handle.is_invalid() {
+            return Err(Error::FfiError(format!(
+                "Windows {label} handle was invalid"
+            )));
+        }
+
+        Ok(Self { handle, label })
+    }
+
+    fn raw_value(&self) -> usize {
+        self.handle.0 as usize
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsHandle {
+    fn drop(&mut self) {
+        if !self.handle.is_invalid() {
+            if let Err(error) = unsafe { CloseHandle(self.handle) } {
+                tracing::warn!(
+                    handle = self.label,
+                    "failed to close Windows handle: {error}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsChild {
+    async fn wait(&mut self) -> Result<ExitStatus> {
+        if let Some(status) = self.exit_status {
+            return Ok(status);
+        }
+
+        let process = self.process.raw_value();
+        let status = unblock(move || wait_for_windows_process(process)).await?;
+        self.exit_status = Some(status);
+        Ok(status)
+    }
+
+    fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
+        if let Some(status) = self.exit_status {
+            return Ok(Some(status));
+        }
+
+        let process = handle_from_raw_value(self.process.raw_value());
+        match unsafe { WaitForSingleObject(process, 0) } {
+            WAIT_TIMEOUT => Ok(None),
+            WAIT_OBJECT_0 => {
+                let status = windows_exit_status(process)?;
+                self.exit_status = Some(status);
+                Ok(Some(status))
+            }
+            WAIT_FAILED => Err(Error::FfiError(format!(
+                "WaitForSingleObject failed: {}",
+                WindowsError::from_win32()
+            ))),
+            event => Err(Error::FfiError(format!(
+                "WaitForSingleObject returned unexpected event {}",
+                event.0
+            ))),
+        }
+    }
+
+    fn kill(&mut self) -> Result<()> {
+        unsafe {
+            TerminateProcess(handle_from_raw_value(self.process.raw_value()), 1)
+                .map_err(|error| Error::FfiError(format!("TerminateProcess failed: {error}")))?;
+        }
+
+        Ok(())
+    }
+
+    async fn wait_with_output(mut self) -> Result<Output> {
+        drop(self.stdin.take());
+
+        let stdout = self.stdout.take().map(read_windows_pipe);
+        let stderr = self.stderr.take().map(read_windows_pipe);
+        let status = self.wait().await?;
+
+        Ok(Output {
+            status,
+            stdout: join_windows_pipe(stdout)?,
+            stderr: join_windows_pipe(stderr)?,
+        })
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn read_windows_pipe(mut pipe: std::fs::File) -> thread::JoinHandle<std::io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut buffer = Vec::new();
+        pipe.read_to_end(&mut buffer)?;
+        Ok(buffer)
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn join_windows_pipe(
+    handle: Option<thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+) -> Result<Vec<u8>> {
+    Ok(match handle {
+        Some(handle) => handle.join().map_err(|_| {
+            Error::ProcessError(std::io::Error::other("pipe reader thread panicked"))
+        })??,
+        None => Vec::new(),
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn wait_for_windows_process(process: usize) -> Result<ExitStatus> {
+    let process = handle_from_raw_value(process);
+    match unsafe { WaitForSingleObject(process, INFINITE) } {
+        WAIT_OBJECT_0 => windows_exit_status(process),
+        WAIT_FAILED => Err(Error::FfiError(format!(
+            "WaitForSingleObject failed: {}",
+            WindowsError::from_win32()
+        ))),
+        event => Err(Error::FfiError(format!(
+            "WaitForSingleObject returned unexpected event {}",
+            event.0
+        ))),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_exit_status(process: HANDLE) -> Result<ExitStatus> {
+    let mut exit_code = 0;
+    unsafe {
+        GetExitCodeProcess(process, &mut exit_code)
+            .map_err(|error| Error::FfiError(format!("GetExitCodeProcess failed: {error}")))?;
+    }
+
+    Ok(ExitStatus::from_raw(exit_code))
+}
+
+#[cfg(target_os = "windows")]
+fn handle_from_raw_value(value: usize) -> HANDLE {
+    HANDLE(value as *mut core::ffi::c_void)
+}
+
 impl Child {
-    pub(crate) fn new(inner: std::process::Child) -> Self {
+    #[cfg(not(target_os = "windows"))]
+    pub(crate) fn from_std(inner: std::process::Child) -> Self {
         let pid = inner.id();
         Self {
-            inner: Some(inner),
+            inner: ChildInner::Std(Some(inner)),
             tracker: None,
             pid,
         }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    pub(crate) fn new(inner: std::process::Child) -> Self {
+        Self::from_std(inner)
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn from_windows(
+        process: HANDLE,
+        thread: HANDLE,
+        pid: u32,
+        stdin: Option<ChildStdin>,
+        stdout: Option<ChildStdout>,
+        stderr: Option<ChildStderr>,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: ChildInner::Windows(Some(WindowsChild {
+                process: WindowsHandle::new(process, "process")?,
+                _thread: WindowsHandle::new(thread, "thread")?,
+                stdin,
+                stdout,
+                stderr,
+                exit_status: None,
+            })),
+            tracker: None,
+            pid,
+        })
     }
 
     pub(crate) fn with_tracker(mut self, tracker: ProcessTracker) -> Self {
@@ -45,34 +261,120 @@ impl Child {
         }
     }
 
+    #[cfg(not(target_os = "windows"))]
+    fn std_child_slot(&mut self) -> &mut Option<std::process::Child> {
+        match &mut self.inner {
+            ChildInner::Std(inner) => inner,
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn windows_child_slot(&mut self) -> &mut Option<WindowsChild> {
+        match &mut self.inner {
+            ChildInner::Windows(inner) => inner,
+        }
+    }
+
     /// Access the child's stdin
-    pub fn stdin(&mut self) -> Option<&mut std::process::ChildStdin> {
-        self.inner.as_mut().and_then(|child| child.stdin.as_mut())
+    pub fn stdin(&mut self) -> Option<&mut ChildStdin> {
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.std_child_slot()
+                .as_mut()
+                .and_then(|child| child.stdin.as_mut())
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            self.windows_child_slot()
+                .as_mut()
+                .and_then(|child| child.stdin.as_mut())
+        }
     }
 
     /// Access the child's stdout
-    pub fn stdout(&mut self) -> Option<&mut std::process::ChildStdout> {
-        self.inner.as_mut().and_then(|child| child.stdout.as_mut())
+    pub fn stdout(&mut self) -> Option<&mut ChildStdout> {
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.std_child_slot()
+                .as_mut()
+                .and_then(|child| child.stdout.as_mut())
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            self.windows_child_slot()
+                .as_mut()
+                .and_then(|child| child.stdout.as_mut())
+        }
     }
 
     /// Access the child's stderr
-    pub fn stderr(&mut self) -> Option<&mut std::process::ChildStderr> {
-        self.inner.as_mut().and_then(|child| child.stderr.as_mut())
+    pub fn stderr(&mut self) -> Option<&mut ChildStderr> {
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.std_child_slot()
+                .as_mut()
+                .and_then(|child| child.stderr.as_mut())
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            self.windows_child_slot()
+                .as_mut()
+                .and_then(|child| child.stderr.as_mut())
+        }
     }
 
     /// Take ownership of the child's stdin
-    pub fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
-        self.inner.as_mut().and_then(|child| child.stdin.take())
+    pub fn take_stdin(&mut self) -> Option<ChildStdin> {
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.std_child_slot()
+                .as_mut()
+                .and_then(|child| child.stdin.take())
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            self.windows_child_slot()
+                .as_mut()
+                .and_then(|child| child.stdin.take())
+        }
     }
 
     /// Take ownership of the child's stdout
-    pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
-        self.inner.as_mut().and_then(|child| child.stdout.take())
+    pub fn take_stdout(&mut self) -> Option<ChildStdout> {
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.std_child_slot()
+                .as_mut()
+                .and_then(|child| child.stdout.take())
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            self.windows_child_slot()
+                .as_mut()
+                .and_then(|child| child.stdout.take())
+        }
     }
 
     /// Take ownership of the child's stderr
-    pub fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
-        self.inner.as_mut().and_then(|child| child.stderr.take())
+    pub fn take_stderr(&mut self) -> Option<ChildStderr> {
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.std_child_slot()
+                .as_mut()
+                .and_then(|child| child.stderr.take())
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            self.windows_child_slot()
+                .as_mut()
+                .and_then(|child| child.stderr.take())
+        }
     }
 
     /// Get the process ID
@@ -82,56 +384,126 @@ impl Child {
 
     /// Wait for the child to exit
     pub async fn wait(&mut self) -> Result<ExitStatus> {
-        let pid = self.pid;
-        let tracker = self.tracker.take();
-        let mut inner = self
-            .inner
-            .take()
-            .expect("child process no longer available");
-        let (inner, status) = unblock(move || {
-            let status = inner.wait();
-            (inner, status)
-        })
-        .await;
-        self.inner = Some(inner);
-        if let Some(tracker) = tracker {
-            tracker.unregister(pid);
+        #[cfg(not(target_os = "windows"))]
+        {
+            let pid = self.pid;
+            let tracker = self.tracker.take();
+            let mut child = self
+                .std_child_slot()
+                .take()
+                .expect("child process no longer available");
+            let (child, status) = unblock(move || {
+                let status = child.wait();
+                (child, status)
+            })
+            .await;
+            *self.std_child_slot() = Some(child);
+            if let Some(tracker) = tracker {
+                tracker.unregister(pid);
+            }
+            Ok(status?)
         }
-        Ok(status?)
+
+        #[cfg(target_os = "windows")]
+        {
+            let pid = self.pid;
+            let tracker = self.tracker.take();
+            let child = self
+                .windows_child_slot()
+                .as_mut()
+                .expect("child process no longer available");
+            let status = child.wait().await?;
+            if let Some(tracker) = tracker {
+                tracker.unregister(pid);
+            }
+            Ok(status)
+        }
     }
 
     /// Wait for the child to exit and collect all output
     pub async fn wait_with_output(self) -> Result<Output> {
-        let inner = self.inner.expect("child process no longer available");
-        let pid = inner.id();
-        let tracker = self.tracker;
-        let output = unblock(move || inner.wait_with_output()).await?;
-        if let Some(tracker) = tracker {
-            tracker.unregister(pid);
+        #[cfg(not(target_os = "windows"))]
+        {
+            match self.inner {
+                ChildInner::Std(inner) => {
+                    let child = inner.expect("child process no longer available");
+                    let pid = child.id();
+                    let tracker = self.tracker;
+                    let output = unblock(move || child.wait_with_output()).await?;
+                    if let Some(tracker) = tracker {
+                        tracker.unregister(pid);
+                    }
+                    Ok(output)
+                }
+            }
         }
-        Ok(output)
+
+        #[cfg(target_os = "windows")]
+        {
+            let Child {
+                inner,
+                tracker,
+                pid,
+            } = self;
+            let child = match inner {
+                ChildInner::Windows(inner) => inner.expect("child process no longer available"),
+            };
+            let output = child.wait_with_output().await?;
+            if let Some(tracker) = tracker {
+                tracker.unregister(pid);
+            }
+            Ok(output)
+        }
     }
 
     /// Attempt to kill the child process
     pub fn kill(&mut self) -> Result<()> {
-        let inner = self
-            .inner
-            .as_mut()
-            .expect("child process no longer available");
-        Ok(inner.kill()?)
+        #[cfg(not(target_os = "windows"))]
+        {
+            let child = self
+                .std_child_slot()
+                .as_mut()
+                .expect("child process no longer available");
+            Ok(child.kill()?)
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let child = self
+                .windows_child_slot()
+                .as_mut()
+                .expect("child process no longer available");
+            child.kill()
+        }
     }
 
     /// Check if the child has exited without blocking
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
-        let inner = self
-            .inner
-            .as_mut()
-            .expect("child process no longer available");
-        let status = inner.try_wait()?;
-        if status.is_some() {
-            self.unregister_if_tracked();
+        #[cfg(not(target_os = "windows"))]
+        {
+            let child = self
+                .std_child_slot()
+                .as_mut()
+                .expect("child process no longer available");
+            let status = child.try_wait()?;
+            if status.is_some() {
+                self.unregister_if_tracked();
+            }
+            Ok(status)
         }
-        Ok(status)
+
+        #[cfg(target_os = "windows")]
+        {
+            let status = self
+                .windows_child_slot()
+                .as_mut()
+                .expect("child process no longer available")
+                .try_wait()?;
+            if status.is_some() {
+                self.unregister_if_tracked();
+            }
+            Ok(status)
+        }
     }
 }
 
@@ -289,6 +661,35 @@ pub(crate) fn create_native_backend() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::platform_capabilities;
+
+    #[cfg(unix)]
+    #[test]
+    fn child_wraps_std_process_id() {
+        let std_child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn test child");
+        let expected_pid = std_child.id();
+
+        let child = super::Child::from_std(std_child);
+
+        assert_eq!(child.id(), expected_pid);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_child_rejects_invalid_process_handle() {
+        use windows::Win32::Foundation::HANDLE;
+
+        let result =
+            super::Child::from_windows(HANDLE::default(), HANDLE::default(), 123, None, None, None);
+
+        match result {
+            Ok(_) => panic!("invalid process handle should be rejected"),
+            Err(err) => assert!(err.to_string().contains("Windows process handle")),
+        }
+    }
 
     #[test]
     fn platform_capabilities_report_backend_name() {
