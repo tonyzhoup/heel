@@ -196,8 +196,8 @@ pub(crate) struct WindowsLaunch<'a> {
 
 #[cfg(target_os = "windows")]
 pub(crate) struct AppContainerLaunchState {
-    profile: super::profile::AppContainerProfile,
     _grant_guard: super::acl::AclGrantGuard,
+    profile: super::profile::AppContainerProfile,
 }
 
 #[cfg(target_os = "windows")]
@@ -207,8 +207,8 @@ impl AppContainerLaunchState {
         grant_guard: super::acl::AclGrantGuard,
     ) -> Self {
         Self {
-            profile,
             _grant_guard: grant_guard,
+            profile,
         }
     }
 
@@ -220,8 +220,11 @@ impl AppContainerLaunchState {
 #[cfg(target_os = "windows")]
 // SAFETY: AppContainerLaunchState owns process-lifetime state only: an
 // AppContainer SID allocated by Windows and released with FreeSid, plus the ACL
-// grant guard. Neither has thread affinity in this staged backend; future ACL
-// mutation state must preserve that invariant before extending this type.
+// grant guard. The guard does not retain the SID and is declared before the
+// profile so ACL restoration runs before FreeSid. The guard owns any
+// thread-affine Windows coordination state through its own owner thread, so
+// moving the launch state does not move raw mutex ownership across threads.
+// Future state must preserve that invariant before extending this type.
 unsafe impl Send for AppContainerLaunchState {}
 
 #[cfg(target_os = "windows")]

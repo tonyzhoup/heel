@@ -292,4 +292,145 @@ mod tests {
             );
         });
     }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Windows AppContainer file boundary enforcement"]
+    fn windows_appcontainer_file_boundaries() {
+        smol::block_on(async {
+            let temp_root = std::env::temp_dir().join(format!(
+                "heel-windows-file-boundaries-{}",
+                std::process::id()
+            ));
+            if temp_root.exists() {
+                std::fs::remove_dir_all(&temp_root).expect("clean stale temp root");
+            }
+            std::fs::create_dir(&temp_root).expect("temp root");
+            let temp_root_guard = TempDirGuard(temp_root.clone());
+
+            let working = temp_root.join("working");
+            let read = temp_root.join("read");
+            let write = temp_root.join("write");
+            let outside = temp_root.join("outside");
+            for dir in [&working, &read, &write, &outside] {
+                std::fs::create_dir(dir).expect("test directory");
+            }
+
+            let read_file = read.join("allowed.txt");
+            let write_file = write.join("created.txt");
+            let outside_file = outside.join("secret.txt");
+            std::fs::write(&read_file, "heel-read-ok").expect("read fixture");
+            std::fs::write(&outside_file, "heel-outside-secret").expect("outside fixture");
+
+            let (_, config) = SandboxConfig::builder()
+                .working_dir(&working)
+                .readable_path(&read)
+                .writable_path(&write)
+                .build()
+                .expect("config")
+                .into_parts();
+            let backend = WindowsBackend::new().expect("backend");
+
+            let read_output = backend
+                .execute(
+                    &config,
+                    0,
+                    "cmd.exe",
+                    &[
+                        "/C".to_string(),
+                        format!("type {}", cmd_quoted_path(&read_file)),
+                    ],
+                    &[],
+                    None,
+                    StdioConfig::Null,
+                    StdioConfig::Piped,
+                    StdioConfig::Piped,
+                )
+                .await
+                .expect("allowed read should launch");
+            assert!(
+                read_output.status.success(),
+                "allowed read failed: stderr={}",
+                String::from_utf8_lossy(&read_output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&read_output.stdout).contains("heel-read-ok"),
+                "allowed read stdout should contain fixture"
+            );
+
+            let write_output = backend
+                .execute(
+                    &config,
+                    0,
+                    "cmd.exe",
+                    &[
+                        "/C".to_string(),
+                        format!("echo heel-write-ok>{}", cmd_quoted_path(&write_file)),
+                    ],
+                    &[],
+                    None,
+                    StdioConfig::Null,
+                    StdioConfig::Piped,
+                    StdioConfig::Piped,
+                )
+                .await
+                .expect("allowed write should launch");
+            assert!(
+                write_output.status.success(),
+                "allowed write failed: stderr={}",
+                String::from_utf8_lossy(&write_output.stderr)
+            );
+            assert_eq!(
+                std::fs::read_to_string(&write_file)
+                    .expect("written file")
+                    .trim(),
+                "heel-write-ok"
+            );
+
+            let outside_output = backend
+                .execute(
+                    &config,
+                    0,
+                    "cmd.exe",
+                    &[
+                        "/C".to_string(),
+                        format!("type {}", cmd_quoted_path(&outside_file)),
+                    ],
+                    &[],
+                    None,
+                    StdioConfig::Null,
+                    StdioConfig::Piped,
+                    StdioConfig::Piped,
+                )
+                .await
+                .expect("outside read command should launch");
+            assert!(
+                !outside_output.status.success(),
+                "outside read unexpectedly succeeded: stdout={}",
+                String::from_utf8_lossy(&outside_output.stdout)
+            );
+
+            drop(temp_root_guard);
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    fn cmd_quoted_path(path: &std::path::Path) -> String {
+        format!("\"{}\"", path.display())
+    }
+
+    #[cfg(target_os = "windows")]
+    struct TempDirGuard(std::path::PathBuf);
+
+    #[cfg(target_os = "windows")]
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_dir_all(&self.0) {
+                tracing::warn!(
+                    path = %self.0.display(),
+                    "failed to remove Windows AppContainer file-boundary temp root: {error}"
+                );
+            }
+        }
+    }
 }
