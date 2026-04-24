@@ -65,16 +65,85 @@ fn slug(input: &str) -> Result<String> {
 #[cfg(target_os = "windows")]
 pub(crate) struct AppContainerProfile {
     name: ProfileName,
+    sid: windows::Win32::Security::PSID,
 }
 
 #[cfg(target_os = "windows")]
 impl AppContainerProfile {
     pub(crate) fn create_or_open(name: ProfileName) -> Result<Self> {
-        Ok(Self { name })
+        use windows::Win32::Security::Isolation::{
+            CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
+        };
+        use windows::core::HSTRING;
+
+        let profile_name = HSTRING::from(name.as_str());
+        let display_name = HSTRING::from(name.as_str());
+        let description = HSTRING::from("Heel sandbox profile");
+
+        let sid = unsafe {
+            match CreateAppContainerProfile(&profile_name, &display_name, &description, None) {
+                Ok(sid) => sid,
+                Err(error) if is_already_exists(&error) => {
+                    DeriveAppContainerSidFromAppContainerName(&profile_name).map_err(|error| {
+                        Error::FfiError(format!(
+                            "DeriveAppContainerSidFromAppContainerName failed for '{}': {error}",
+                            name.as_str()
+                        ))
+                    })?
+                }
+                Err(error) => {
+                    return Err(Error::FfiError(format!(
+                        "CreateAppContainerProfile failed for '{}': {error}",
+                        name.as_str()
+                    )));
+                }
+            }
+        };
+
+        if sid.is_invalid() {
+            return Err(Error::FfiError(format!(
+                "AppContainer SID for '{}' was null",
+                name.as_str()
+            )));
+        }
+
+        Ok(Self { name, sid })
     }
 
     pub(crate) fn name(&self) -> &str {
         self.name.as_str()
+    }
+
+    pub(crate) fn sid(&self) -> windows::Win32::Security::PSID {
+        self.sid
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for AppContainerProfile {
+    fn drop(&mut self) {
+        if !self.sid.is_invalid() {
+            unsafe {
+                windows::Win32::Security::FreeSid(self.sid);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn is_already_exists(error: &windows::core::Error) -> bool {
+    use windows::Win32::Foundation::ERROR_ALREADY_EXISTS;
+
+    let code = error.code().0 as u32;
+    code == hresult_from_win32(ERROR_ALREADY_EXISTS.0)
+}
+
+#[cfg(target_os = "windows")]
+fn hresult_from_win32(error: u32) -> u32 {
+    if error == 0 {
+        error
+    } else {
+        (error & 0x0000_FFFF) | 0x8007_0000
     }
 }
 
@@ -136,5 +205,26 @@ mod tests {
             err.to_string()
                 .contains("AppContainer profile app id cannot be empty")
         );
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_tests {
+    use super::{AppContainerProfile, hresult_from_win32, profile_name};
+    use windows::Win32::Foundation::ERROR_ALREADY_EXISTS;
+
+    #[test]
+    fn hresult_from_win32_maps_already_exists() {
+        assert_eq!(hresult_from_win32(ERROR_ALREADY_EXISTS.0), 0x8007_00B7);
+    }
+
+    #[test]
+    #[ignore = "creates local AppContainer profile state"]
+    fn appcontainer_profile_create_or_open_returns_sid() {
+        let name = profile_name("heel-test", "profile-create-or-open").expect("name");
+        let profile = AppContainerProfile::create_or_open(name).expect("profile");
+
+        assert!(!profile.sid().is_invalid());
+        assert!(profile.name().starts_with("heel."));
     }
 }
