@@ -135,6 +135,64 @@ impl Child {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlatformCapabilities {
+    pub backend: &'static str,
+    pub filesystem_strict: bool,
+    pub network_deny_all: bool,
+    pub network_allowlist: bool,
+    pub ipc: bool,
+    pub background_process_tree_cleanup: bool,
+}
+
+#[cfg(target_os = "macos")]
+pub fn platform_capabilities() -> PlatformCapabilities {
+    PlatformCapabilities {
+        backend: "macos_sandbox_exec",
+        filesystem_strict: false,
+        network_deny_all: true,
+        network_allowlist: true,
+        ipc: true,
+        background_process_tree_cleanup: false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn platform_capabilities() -> PlatformCapabilities {
+    PlatformCapabilities {
+        backend: "linux_landlock_seccomp",
+        filesystem_strict: true,
+        network_deny_all: true,
+        network_allowlist: true,
+        ipc: true,
+        background_process_tree_cleanup: false,
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn platform_capabilities() -> PlatformCapabilities {
+    PlatformCapabilities {
+        backend: "windows_appcontainer",
+        filesystem_strict: true,
+        network_deny_all: true,
+        network_allowlist: false,
+        ipc: false,
+        background_process_tree_cleanup: true,
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub fn platform_capabilities() -> PlatformCapabilities {
+    PlatformCapabilities {
+        backend: "unsupported",
+        filesystem_strict: false,
+        network_deny_all: false,
+        network_allowlist: false,
+        ipc: false,
+        background_process_tree_cleanup: false,
+    }
+}
+
 /// Internal trait for platform-specific sandbox backends
 pub(crate) trait Backend: Sized + Send + Sync {
     /// Execute a command and wait for completion
@@ -187,4 +245,36 @@ pub(crate) fn create_native_backend() -> Result<windows::WindowsBackend> {
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub(crate) fn create_native_backend() -> Result<()> {
     Err(crate::error::Error::UnsupportedPlatform)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::platform_capabilities;
+
+    #[test]
+    fn platform_capabilities_report_backend_name() {
+        let capabilities = platform_capabilities();
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(capabilities.backend, "macos_sandbox_exec");
+
+        #[cfg(target_os = "linux")]
+        assert_eq!(capabilities.backend, "linux_landlock_seccomp");
+
+        #[cfg(target_os = "windows")]
+        assert_eq!(capabilities.backend, "windows_appcontainer");
+    }
+
+    #[test]
+    fn windows_first_release_capability_contract_is_explicit() {
+        let capabilities = platform_capabilities();
+
+        if cfg!(target_os = "windows") {
+            assert!(capabilities.filesystem_strict);
+            assert!(capabilities.network_deny_all);
+            assert!(!capabilities.network_allowlist);
+            assert!(!capabilities.ipc);
+            assert!(capabilities.background_process_tree_cleanup);
+        }
+    }
 }

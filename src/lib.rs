@@ -84,7 +84,7 @@ pub use ipc::{IpcCommand, IpcError, IpcRouter};
 pub use network::{
     AllowAll, AllowList, ConnectionDirection, CustomPolicy, DenyAll, DomainRequest, NetworkPolicy,
 };
-pub use platform::Child;
+pub use platform::{Child, PlatformCapabilities, platform_capabilities};
 pub use python::VenvManager;
 /// Re-export rmp_serde for IpcCommand::apply_args implementations.
 pub use rmp_serde;
