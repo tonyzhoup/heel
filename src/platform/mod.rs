@@ -608,9 +608,9 @@ pub fn platform_capabilities() -> PlatformCapabilities {
 fn windows_capabilities() -> PlatformCapabilities {
     PlatformCapabilities {
         backend: "windows_appcontainer",
-        execution_supported: false,
-        filesystem_strict: false,
-        network_deny_all: false,
+        execution_supported: true,
+        filesystem_strict: true,
+        network_deny_all: true,
         network_allowlist: false,
         ipc: false,
         background_process_tree_cleanup: true,
@@ -735,9 +735,9 @@ mod tests {
         let capabilities = platform_capabilities();
 
         if cfg!(target_os = "windows") {
-            assert!(!capabilities.execution_supported);
-            assert!(!capabilities.filesystem_strict);
-            assert!(!capabilities.network_deny_all);
+            assert!(capabilities.execution_supported);
+            assert!(capabilities.filesystem_strict);
+            assert!(capabilities.network_deny_all);
             assert!(!capabilities.network_allowlist);
             assert!(!capabilities.ipc);
             assert!(capabilities.background_process_tree_cleanup);
@@ -745,13 +745,13 @@ mod tests {
     }
 
     #[test]
-    fn windows_stub_capability_contract_is_fail_closed() {
+    fn windows_appcontainer_capability_contract_is_explicit() {
         let capabilities = super::windows_capabilities();
 
         assert_eq!(capabilities.backend, "windows_appcontainer");
-        assert!(!capabilities.execution_supported);
-        assert!(!capabilities.filesystem_strict);
-        assert!(!capabilities.network_deny_all);
+        assert!(capabilities.execution_supported);
+        assert!(capabilities.filesystem_strict);
+        assert!(capabilities.network_deny_all);
         assert!(!capabilities.network_allowlist);
         assert!(!capabilities.ipc);
         assert!(capabilities.background_process_tree_cleanup);
@@ -820,9 +820,9 @@ mod tests {
             capabilities,
             super::PlatformCapabilities {
                 backend: "windows_appcontainer",
-                execution_supported: false,
-                filesystem_strict: false,
-                network_deny_all: false,
+                execution_supported: true,
+                filesystem_strict: true,
+                network_deny_all: true,
                 network_allowlist: false,
                 ipc: false,
                 background_process_tree_cleanup: true,

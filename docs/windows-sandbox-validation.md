@@ -38,6 +38,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File G:\MyCodeRepo\Heel\scrip
 
 脚本会从自身位置解析仓库根目录，默认在 `$env:TEMP\heel-win-validation\run-*` 下创建唯一验证目录，并输出 transcript log 和 markdown report 路径。需要强制完整 AppContainer 验收时使用 `-Mode Full`；需要验证旧的 unsupported fail-closed 合同时使用 `-Mode FailClosed`。
 
+当前 `feat/windows-support` 分支预期进入完整 AppContainer 验收路径：执行、严格文件边界、`DenyAll` 网络和后台进程树清理都应通过；`FailClosed` 仅用于回归旧合同时手动指定。
+
 建议的脚本执行外壳：
 
 ```powershell
@@ -103,6 +105,7 @@ Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsBuildNumb
 
 ```powershell
 cargo test -p heel --lib
+cargo test -p heel --bins
 cargo build -p heel --bin heel
 
 $Heel = Join-Path $Repo "target\debug\heel.exe"
@@ -111,7 +114,7 @@ $Heel = Join-Path $Repo "target\debug\heel.exe"
 
 通过标准：
 
-- `cargo test -p heel --lib` 通过，或者只有与当前 Windows 未落地能力一致的 fail-closed 断言变化。
+- `cargo test -p heel --lib` 和 `cargo test -p heel --bins` 通过，或者只有与当前 Windows 未落地能力一致的 fail-closed 断言变化。
 - `target\debug\heel.exe` 构建成功。
 - `heel --version` 可输出版本。
 
@@ -265,7 +268,10 @@ if ($LASTEXITCODE -eq 0) {
 先验证无第三方包的脚本执行。包安装和 venv 准备属于宿主准备阶段，不应在沙箱内获得额外网络能力。
 
 ```powershell
-$Python = (Get-Command python.exe).Source
+$Python = (Get-ChildItem (Join-Path $env:LOCALAPPDATA "Programs\Python") -Recurse -Filter python.exe | Select-Object -First 1).FullName
+if ([string]::IsNullOrWhiteSpace($Python)) {
+    throw "real python.exe was not found; Microsoft Store aliases are not valid for this validation"
+}
 $Probe = Join-Path $Sandbox "probe.py"
 
 @"
@@ -287,7 +293,12 @@ Get-Content (Join-Path $Sandbox "python-ok.txt")
 
 - 输出包含 `python-ok`。
 - 写入只发生在 `$Sandbox`。
+- Python 进程内读取/写入未授权外部路径失败，且受保护文件内容不出现在输出中。
+- Python socket/HTTP 出网失败；不能用宿主代理或环境变量绕过 `DenyAll`。
 - Python 解释器及其运行时根必须由 Windows 后端按 runtime/executable root 处理，不应通过放宽用户目录实现。
+- `heel python --venv <path>` 在 Windows 上不传 `--python` 时应跳过 Microsoft Store `WindowsApps` alias，自动解析真实 Python，创建 venv 后能导入 venv `site-packages`，同时保持外部读写和网络拒绝。
+
+已知行为：CPython 3.14 在 AppContainer 内可能向 stderr 输出 `Failed to find real location of ...\python.exe`。当前实测原因是 CPython Windows path 初始化调用 `GetFinalPathNameByHandleW(..., VOLUME_NAME_DOS)` 时返回 `ERROR_ACCESS_DENIED`；同一进程仍能正确执行脚本、解析 `sys.executable`/`sys.prefix`，且文件和网络隔离检查仍然有效。因此验证以退出码和隔离断言为准，不把这条 CPython realpath 警告单独视为失败。
 
 ## 8. 环境变量与当前目录
 
@@ -395,6 +406,7 @@ cargo test -p heel windows_policy_rejects_ipc
 | Network DenyAll | PASS/FAIL | command output summary |
 | Non-DenyAll rejected | PASS/FAIL | command output summary |
 | Python smoke | PASS/FAIL | command output summary |
+| Python venv smoke | PASS/FAIL | command output summary |
 | Env and cwd | PASS/FAIL | command output summary |
 | Process tree cleanup | PASS/FAIL/NA | command output summary |
 

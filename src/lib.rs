@@ -3,8 +3,8 @@
 //! This library provides a simple API for running untrusted code in a secure sandbox.
 //! It uses platform-native sandboxing mechanisms:
 //! - macOS: `sandbox-exec` with SBPL profiles
-//! - Linux: Landlock + Seccomp (planned)
-//! - Windows: AppContainer (planned)
+//! - Linux: Landlock + Seccomp
+//! - Windows: AppContainer
 //!
 //! # Example
 //!

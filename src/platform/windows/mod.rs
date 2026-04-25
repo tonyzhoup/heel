@@ -54,6 +54,7 @@ fn launch_supported_config(
     {
         let base_envs =
             process::allowed_environment_from(std::env::vars(), config.env_passthrough())?;
+        let envs = appcontainer_runtime_env(config, envs);
         let profile = profile::AppContainerProfile::create_or_open(profile_name)?;
         let grant_guard = acl::apply_grants_for_appcontainer_sid(&grants, profile.sid())?;
         let launch_state = process::AppContainerLaunchState::new(profile, grant_guard);
@@ -62,7 +63,7 @@ fn launch_supported_config(
             args,
             current_dir,
             base_envs: &base_envs,
-            envs,
+            envs: &envs,
             stdin,
             stdout,
             stderr,
@@ -89,6 +90,22 @@ fn launch_supported_config(
 
         Err(crate::error::Error::UnsupportedPlatform)
     }
+}
+
+#[cfg(target_os = "windows")]
+fn appcontainer_runtime_env(
+    config: &SandboxConfigData,
+    envs: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut effective = envs.to_vec();
+    // CreateProcessW needs LOCALAPPDATA when launching with AppContainer
+    // security capabilities. Using the sandbox root keeps the redirected
+    // Packages\<profile>\AC tree inside Heel's writable boundary.
+    effective.push((
+        "LOCALAPPDATA".to_string(),
+        config.working_dir().to_string_lossy().into_owned(),
+    ));
+    effective
 }
 
 impl Backend for WindowsBackend {
@@ -157,6 +174,8 @@ mod tests {
     use crate::platform::Backend;
     use crate::stdio::StdioConfig;
     #[cfg(target_os = "windows")]
+    use std::path::{Path, PathBuf};
+    #[cfg(target_os = "windows")]
     use std::process::Output;
 
     #[test]
@@ -224,6 +243,28 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_runtime_env_forces_localappdata_into_working_dir() {
+        let (_, config) = SandboxConfig::builder()
+            .working_dir("C:/Heel/session")
+            .build()
+            .expect("config")
+            .into_parts();
+        let envs = super::appcontainer_runtime_env(
+            &config,
+            &[(
+                "LOCALAPPDATA".to_string(),
+                "C:/Users/host/AppData/Local".to_string(),
+            )],
+        );
+        let block = super::process::environment_block_from([], &envs).expect("environment block");
+        let decoded = String::from_utf16(&block).expect("utf16 env block");
+
+        assert!(decoded.contains("LOCALAPPDATA=C:/Heel/session"));
+        assert!(!decoded.contains("C:/Users/host/AppData/Local"));
+    }
+
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn windows_backend_still_fails_closed_until_process_launch_lands() {
@@ -268,10 +309,7 @@ mod tests {
     #[ignore = "requires Windows AppContainer process launch"]
     fn windows_backend_executes_cmd_echo_in_appcontainer() {
         smol::block_on(async {
-            let (_, config) = SandboxConfig::builder()
-                .build()
-                .expect("config")
-                .into_parts();
+            let (_temp_guard, config) = temp_config("heel-windows-echo");
             let backend = WindowsBackend::new().expect("backend");
 
             let output = backend
@@ -302,10 +340,7 @@ mod tests {
     #[ignore = "requires Windows AppContainer process launch and host process polling"]
     fn windows_job_kills_process_tree() {
         smol::block_on(async {
-            let (_, config) = SandboxConfig::builder()
-                .build()
-                .expect("config")
-                .into_parts();
+            let (_temp_guard, config) = temp_config("heel-windows-job");
             let backend = WindowsBackend::new().expect("backend");
             let marker = unique_marker("heel-job-tree");
 
@@ -324,9 +359,8 @@ mod tests {
                 .await
                 .expect("cmd should launch sleep descendant in the process tree");
 
-            let root_pid = child.id();
             poll_until("sleep descendant starts", || {
-                child_process_exists(root_pid, "powershell.exe", &marker)
+                command_line_process_exists(&marker)
             })
             .expect("sleep child should appear before killing root");
 
@@ -345,24 +379,22 @@ mod tests {
     #[ignore = "requires Windows AppContainer process launch and host process polling"]
     fn windows_wait_closes_job_after_root_exits_with_background_descendant() {
         smol::block_on(async {
-            let (_, config) = SandboxConfig::builder()
-                .build()
-                .expect("config")
-                .into_parts();
+            let (_temp_guard, config) = temp_config("heel-windows-wait");
             let backend = WindowsBackend::new().expect("backend");
-            let marker = unique_marker("heel-wait-tree");
+            let (spawner, marker) =
+                write_background_file_probe(config.working_dir(), "heel-wait-tree", 2, None);
 
             let mut child = backend
                 .spawn(
                     &config,
                     0,
-                    "cmd.exe",
+                    "powershell.exe",
                     &[
-                        "/C".to_string(),
-                        format!(
-                            "{} & powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 2\"",
-                            background_sleep_command(&marker, 120)
-                        ),
+                        "-NoProfile".to_string(),
+                        "-ExecutionPolicy".to_string(),
+                        "Bypass".to_string(),
+                        "-File".to_string(),
+                        spawner.to_string_lossy().into_owned(),
                     ],
                     &[],
                     None,
@@ -373,19 +405,21 @@ mod tests {
                 .await
                 .expect("cmd should launch sleep descendant in the process tree");
 
-            let root_pid = child.id();
             poll_until("sleep descendant starts before root exits", || {
-                child_process_exists(root_pid, "powershell.exe", &marker)
+                line_count(&marker) > 0
             })
             .expect("sleep child should appear before waiting for root");
 
             let status = child.wait().await.expect("root wait should succeed");
             assert!(status.success(), "root command should exit successfully");
 
-            poll_until("sleep descendant exits after wait closes the job", || {
-                !command_line_process_exists(&marker)
-            })
-            .expect("sleep child should exit when wait observes root exit");
+            let after_wait = line_count(&marker);
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            let after_sleep = line_count(&marker);
+            assert_eq!(
+                after_sleep, after_wait,
+                "background marker should stop changing after wait closes the job"
+            );
         });
     }
 
@@ -394,13 +428,14 @@ mod tests {
     #[ignore = "requires Windows AppContainer process launch and host process polling"]
     fn windows_output_closes_job_before_joining_piped_background_descendant() {
         smol::block_on(async {
-            let (_, config) = SandboxConfig::builder()
-                .build()
-                .expect("config")
-                .into_parts();
+            let (_temp_guard, config) = temp_config("heel-windows-output");
             let backend = WindowsBackend::new().expect("backend");
-            let marker = unique_marker("heel-output-tree");
-            let background_marker = marker.clone();
+            let (spawner, marker) = write_background_file_probe(
+                config.working_dir(),
+                "heel-output-tree",
+                0,
+                Some("heel-output-root-done"),
+            );
 
             let (sender, receiver) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
@@ -409,13 +444,13 @@ mod tests {
                         .execute(
                             &config,
                             0,
-                            "cmd.exe",
+                            "powershell.exe",
                             &[
-                                "/C".to_string(),
-                                format!(
-                                    "{} & echo heel-output-root-done",
-                                    background_sleep_command(&background_marker, 120)
-                                ),
+                                "-NoProfile".to_string(),
+                                "-ExecutionPolicy".to_string(),
+                                "Bypass".to_string(),
+                                "-File".to_string(),
+                                spawner.to_string_lossy().into_owned(),
                             ],
                             &[],
                             None,
@@ -443,9 +478,12 @@ mod tests {
                 "root command should exit successfully: stderr={}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            assert!(
-                !command_line_process_exists(&marker),
-                "background sleep descendant should be gone after output() closes the job"
+            let after_output = line_count(&marker);
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            let after_sleep = line_count(&marker);
+            assert_eq!(
+                after_sleep, after_output,
+                "background marker should stop changing after output() closes the job"
             );
         });
     }
@@ -492,10 +530,15 @@ mod tests {
                 .execute(
                     &config,
                     0,
-                    "cmd.exe",
+                    "powershell.exe",
                     &[
-                        "/C".to_string(),
-                        format!("type {}", cmd_quoted_path(&read_file)),
+                        "-NoProfile".to_string(),
+                        "-NonInteractive".to_string(),
+                        "-Command".to_string(),
+                        format!(
+                            "$ErrorActionPreference='Stop'; Get-Content -Raw -LiteralPath {}",
+                            ps_literal_path(&read_file)
+                        ),
                     ],
                     &[],
                     None,
@@ -519,10 +562,16 @@ mod tests {
                 .execute(
                     &config,
                     0,
-                    "cmd.exe",
+                    "powershell.exe",
                     &[
-                        "/C".to_string(),
-                        format!("echo heel-write-ok>{}", cmd_quoted_path(&write_file)),
+                        "-NoProfile".to_string(),
+                        "-NonInteractive".to_string(),
+                        "-Command".to_string(),
+                        format!(
+                            "$ErrorActionPreference='Stop'; Set-Content -NoNewline -Encoding ASCII -LiteralPath {} -Value 'heel-write-ok'; Get-Content -Raw -LiteralPath {}",
+                            ps_literal_path(&write_file),
+                            ps_literal_path(&write_file)
+                        ),
                     ],
                     &[],
                     None,
@@ -548,10 +597,15 @@ mod tests {
                 .execute(
                     &config,
                     0,
-                    "cmd.exe",
+                    "powershell.exe",
                     &[
-                        "/C".to_string(),
-                        format!("type {}", cmd_quoted_path(&outside_file)),
+                        "-NoProfile".to_string(),
+                        "-NonInteractive".to_string(),
+                        "-Command".to_string(),
+                        format!(
+                            "$ErrorActionPreference='Stop'; Get-Content -Raw -LiteralPath {}",
+                            ps_literal_path(&outside_file)
+                        ),
                     ],
                     &[],
                     None,
@@ -751,10 +805,7 @@ function Exit-ProbeError {
 
     #[cfg(target_os = "windows")]
     async fn run_default_deny_all_powershell(script: &str) -> crate::error::Result<Output> {
-        let (_, config) = SandboxConfig::builder()
-            .build()
-            .expect("config")
-            .into_parts();
+        let (_temp_guard, config) = temp_config("heel-windows-network");
         let backend = WindowsBackend::new().expect("backend");
 
         backend
@@ -832,8 +883,8 @@ function Exit-ProbeError {
     }
 
     #[cfg(target_os = "windows")]
-    fn cmd_quoted_path(path: &std::path::Path) -> String {
-        format!("\"{}\"", path.display())
+    fn ps_literal_path(path: &std::path::Path) -> String {
+        format!("'{}'", path.display().to_string().replace('\'', "''"))
     }
 
     #[cfg(target_os = "windows")]
@@ -854,21 +905,10 @@ function Exit-ProbeError {
     }
 
     #[cfg(target_os = "windows")]
-    fn child_process_exists(parent_pid: u32, image_name: &str, command_marker: &str) -> bool {
-        powershell_process_query(&format!(
-            "ParentProcessId = {parent_pid} AND Name = '{image_name}' AND CommandLine LIKE '%{command_marker}%'"
-        ))
-    }
-
-    #[cfg(target_os = "windows")]
     fn command_line_process_exists(command_marker: &str) -> bool {
-        powershell_process_query(&format!("CommandLine LIKE '%{command_marker}%'"))
-    }
-
-    #[cfg(target_os = "windows")]
-    fn powershell_process_query(filter: &str) -> bool {
+        let marker = ps_single_quoted(command_marker);
         let script = format!(
-            "$p = Get-CimInstance Win32_Process -Filter \"{filter}\"; if ($p) {{ exit 0 }} else {{ exit 1 }}"
+            "$marker = {marker}; $p = Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne $PID -and $_.CommandLine -like \"*$marker*\" }}; if ($p) {{ exit 0 }} else {{ exit 1 }}"
         );
         let Ok(status) = std::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
@@ -881,6 +921,11 @@ function Exit-ProbeError {
     }
 
     #[cfg(target_os = "windows")]
+    fn ps_single_quoted(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+
+    #[cfg(target_os = "windows")]
     fn background_sleep_command(marker: &str, seconds: u32) -> String {
         format!(
             "start \"\" /B powershell.exe -NoProfile -NonInteractive -Command \"$m='{marker}'; Start-Sleep -Seconds {seconds}\""
@@ -888,8 +933,68 @@ function Exit-ProbeError {
     }
 
     #[cfg(target_os = "windows")]
+    fn write_background_file_probe(
+        root: &Path,
+        name: &str,
+        parent_seconds: u32,
+        root_output: Option<&str>,
+    ) -> (PathBuf, PathBuf) {
+        let loop_script = root.join(format!("{name}-loop.ps1"));
+        let spawner_script = root.join(format!("{name}-spawner.ps1"));
+        let marker = root.join(format!("{name}-marker.txt"));
+
+        std::fs::write(
+            &loop_script,
+            format!(
+                "while ($true) {{ Add-Content -Encoding UTF8 {} 'tick'; Start-Sleep -Seconds 1 }}",
+                ps_literal_path(&marker)
+            ),
+        )
+        .expect("write background loop script");
+        let output_line = root_output
+            .map(|output| format!("Write-Output {}\n", ps_single_quoted(output)))
+            .unwrap_or_default();
+        std::fs::write(
+            &spawner_script,
+            format!(
+                "Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',{})\n{output_line}Start-Sleep -Seconds {parent_seconds}\n",
+                ps_literal_path(&loop_script),
+            ),
+        )
+        .expect("write background spawner script");
+
+        (spawner_script, marker)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn line_count(path: &Path) -> usize {
+        match std::fs::read_to_string(path) {
+            Ok(content) => content.lines().count(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => panic!("failed to read marker {}: {error}", path.display()),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
     fn unique_marker(prefix: &str) -> String {
         format!("{prefix}-{}", std::process::id())
+    }
+
+    #[cfg(target_os = "windows")]
+    fn temp_config(prefix: &str) -> (TempDirGuard, crate::config::SandboxConfigData) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("{prefix}-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("temp working root");
+        let guard = TempDirGuard(root.clone());
+        let (_, config) = SandboxConfig::builder()
+            .working_dir(root)
+            .build()
+            .expect("config")
+            .into_parts();
+        (guard, config)
     }
 
     #[cfg(target_os = "windows")]

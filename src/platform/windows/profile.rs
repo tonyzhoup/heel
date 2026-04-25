@@ -64,7 +64,6 @@ fn slug(input: &str) -> Result<String> {
 
 #[cfg(target_os = "windows")]
 pub(crate) struct AppContainerProfile {
-    name: ProfileName,
     sid: windows::Win32::Security::PSID,
 }
 
@@ -107,11 +106,7 @@ impl AppContainerProfile {
             )));
         }
 
-        Ok(Self { name, sid })
-    }
-
-    pub(crate) fn name(&self) -> &str {
-        self.name.as_str()
+        Ok(Self { sid })
     }
 
     pub(crate) fn sid(&self) -> windows::Win32::Security::PSID {
@@ -222,9 +217,10 @@ mod windows_tests {
     #[ignore = "creates local AppContainer profile state"]
     fn appcontainer_profile_create_or_open_returns_sid() {
         let name = profile_name("heel-test", "profile-create-or-open").expect("name");
+        let name_text = name.as_str().to_string();
         let profile = AppContainerProfile::create_or_open(name).expect("profile");
 
         assert!(!profile.sid().is_invalid());
-        assert!(profile.name().starts_with("heel."));
+        assert!(name_text.starts_with("heel."));
     }
 }
